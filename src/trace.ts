@@ -89,7 +89,7 @@ function emitTurn(turn: Turn, turnNum: number, transcriptPath: string, config: C
           : undefined;
 
     const generation = startObservation(
-      `Claude Generation ${idx + 1}`,
+      "Claude Generation",
       {
         input,
         output: buildGenerationOutput(step, clip),

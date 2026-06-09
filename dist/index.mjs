@@ -46887,15 +46887,14 @@ function emitTurn(turn, turnNum, transcriptPath, config$1) {
 	let prevTs = turn.userTimestamp;
 	let prevToolResults;
 	turn.steps.forEach((step, idx) => {
-		const input = idx === 0 ? {
-			role: "user",
-			content: clip(turn.userText)
-		} : prevToolResults ? {
-			role: "tool",
-			tool_results: prevToolResults
-		} : void 0;
-		const generation = startObservation(`Claude Generation ${idx + 1}`, {
-			input,
+		const generation = startObservation("Claude Generation", {
+			input: idx === 0 ? {
+				role: "user",
+				content: clip(turn.userText)
+			} : prevToolResults ? {
+				role: "tool",
+				tool_results: prevToolResults
+			} : void 0,
 			output: buildGenerationOutput(step, clip),
 			model: step.model,
 			usageDetails: step.usage,
