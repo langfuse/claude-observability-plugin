@@ -1,6 +1,6 @@
 {
   "name": "@langfuse/claude-observability-plugin",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Claude Code plugin that traces sessions, turns, generations, and tool calls to Langfuse",
   "keywords": [
     "claude-code",
