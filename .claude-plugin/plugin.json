@@ -1,5 +1,5 @@
 {
-  "name": "langfuse",
+  "name": "langfuse-observability",
   "description": "The Langfuse x Claude Code Observability Plugin",
   "version": "3.0.0",
   "author": {
@@ -28,10 +28,33 @@
       "description": "Langfuse host. Use https://us.cloud.langfuse.com for US, https://cloud.langfuse.com for EU, or your self-hosted URL.",
       "default": "https://us.cloud.langfuse.com"
     },
+    "LANGFUSE_USER_ID": {
+      "type": "string",
+      "title": "User ID",
+      "description": "Optional user identifier attached to every trace (shown as the user in Langfuse). Leave empty to omit."
+    },
     "CC_LANGFUSE_DEBUG": {
       "type": "boolean",
       "title": "Debug logging",
-      "description": "Write verbose logs to ~/.claude/state/langfuse_hook.log",
+      "description": "Write verbose logs to stderr",
+      "default": false
+    },
+    "CC_LANGFUSE_MAX_CHARS": {
+      "type": "number",
+      "title": "Max characters per field",
+      "description": "Truncate captured inputs/outputs to this many characters",
+      "default": 20000
+    },
+    "CC_LANGFUSE_SKILL_TAGS": {
+      "type": "boolean",
+      "title": "Tag traces with skills",
+      "description": "Add a skill:<name> tag to traces for every skill invoked in the turn",
+      "default": true
+    },
+    "CC_LANGFUSE_CAPTURE_SKILL_CONTENT": {
+      "type": "boolean",
+      "title": "Capture skill instructions",
+      "description": "Include the injected skill instruction text in the Skill tool span output",
       "default": false
     }
   }

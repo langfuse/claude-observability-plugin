@@ -10,6 +10,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}/dist/index.mjs\"",
+            "timeout": 30
+          }
+        ]
+      }
     ]
   }
 }
