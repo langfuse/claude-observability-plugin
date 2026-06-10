@@ -1,5 +1,5 @@
 {
-  "name": "langfuse",
+  "name": "langfuse-observability",
   "description": "The Langfuse x Claude Code Observability Plugin",
   "version": "1.0.0",
   "author": {

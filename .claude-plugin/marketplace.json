@@ -7,7 +7,7 @@
   },
   "plugins": [
     {
-      "name": "langfuse",
+      "name": "langfuse-observability",
       "source": "./",
       "description": "Trace Claude Code sessions to Langfuse"
     }

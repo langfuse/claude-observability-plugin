@@ -6,7 +6,7 @@ Trace every Claude Code session to [Langfuse](https://langfuse.com) — turns, g
 
 ```bash
 claude plugin marketplace add langfuse/Claude-Observability-Plugin
-claude plugin install langfuse@langfuse-observability
+claude plugin install langfuse-observability@langfuse-observability
 ```
 
 Restart Claude Code after install.
@@ -41,23 +41,37 @@ A hook reads the session transcript incrementally on every turn (Stop) and at se
 
 State is kept in `~/.claude/state/langfuse_state.json` so re-runs only emit new turns.
 
+## Privacy
+
+This plugin transmits your Claude Code session data — conversation turns, assistant
+generations, tool calls, and token-usage statistics — to the Langfuse endpoint you
+configure (`LANGFUSE_BASE_URL`, default `https://us.cloud.langfuse.com`; EU and
+self-hosted endpoints are supported). Data is sent at the end of each turn (the
+`Stop` hook) and at session end (`SessionEnd`) using the Langfuse API keys you
+provide, which are stored in your OS keychain. No data is sent anywhere other than
+the endpoint you configure.
+
+For how Langfuse Cloud handles data it receives, see the Langfuse privacy policy:
+https://langfuse.com/privacy . When using a self-hosted Langfuse instance, your data
+stays within your own infrastructure.
+
 ## Reconfigure
 
 ```bash
-claude plugin disable langfuse
-claude plugin enable langfuse
+claude plugin disable langfuse-observability
+claude plugin enable langfuse-observability
 ```
 
 ## Uninstall
 
 ```bash
-claude plugin uninstall langfuse
+claude plugin uninstall langfuse-observability
 ```
 
 ## Troubleshooting
 
 - Nothing in Langfuse: check `~/.claude/state/langfuse_hook.log` (enable `CC_LANGFUSE_DEBUG`).
-- Hook not firing: confirm with `claude plugin list` that langfuse is enabled; restart Claude Code.
+- Hook not firing: confirm with `claude plugin list` that langfuse-observability is enabled; restart Claude Code.
 - langfuse import errors (no uv): ensure the `python3` on your PATH has the SDK installed, or install uv.
 
 ## License
