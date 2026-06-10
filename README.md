@@ -18,10 +18,10 @@ Original timestamps are preserved on every span, so the Langfuse timeline reflec
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org) >= 20
+- [Bun](https://bun.sh) >= 1.2
 - A [Langfuse Cloud](https://cloud.langfuse.com) account (or a [self-hosted](https://langfuse.com/self-hosting) instance) and API keys
 
-No Python and no `pip install` — the hook ships as a single self-contained JavaScript bundle that runs on the Node.js already required by most dev environments.
+No Python and no `pip install` — the hook ships as a single self-contained JavaScript bundle that Bun runs directly; no `node_modules`, no install step.
 
 ## Installation
 
@@ -103,7 +103,7 @@ Instead of environment variables you can create `~/.claude/langfuse.json` (globa
 
 ## How it works
 
-A `Stop` hook runs `node "${CLAUDE_PLUGIN_ROOT}/dist/index.mjs"` after every turn. The hook reads the session transcript **incrementally**: a small sidecar file next to the transcript (`<transcript>.jsonl.langfuse`) records the byte offset already processed and the number of turns emitted, so each turn is uploaded exactly once even though the hook fires repeatedly over the life of a session.
+A `Stop` hook runs `bun "${CLAUDE_PLUGIN_ROOT}/dist/index.mjs"` after every turn. The hook reads the session transcript **incrementally**: a small sidecar file next to the transcript (`<transcript>.jsonl.langfuse`) records the byte offset already processed and the number of turns emitted, so each turn is uploaded exactly once even though the hook fires repeatedly over the life of a session.
 
 Spans are sent via the [Langfuse TypeScript SDK](https://langfuse.com/docs/sdk/typescript) on top of OpenTelemetry, batched, and flushed once at the end of the hook (capped by the hook's 30s timeout). The hook **fails open**: any error is swallowed (logged in debug mode) so a tracing problem never blocks your Claude Code session.
 
@@ -112,13 +112,13 @@ Spans are sent via the [Langfuse TypeScript SDK](https://langfuse.com/docs/sdk/t
 The hook ships as a committed, pre-bundled `dist/index.mjs` so it runs without an install step. To work on it:
 
 ```bash
-pnpm install
-pnpm run build       # bundle src/ → dist/index.mjs (tsdown)
-pnpm run test        # vitest
-pnpm run lint        # prettier + tsc --noEmit + verify dist is up to date
+bun install
+bun run build        # bundle src/ → dist/index.mjs (bun build)
+bun run test         # bun test
+bun run lint         # prettier + tsc --noEmit + verify dist is up to date
 ```
 
-All runtime dependencies (Langfuse SDK, OpenTelemetry, zod) are bundled into the single `dist/index.mjs`; only Node.js built-ins stay external. Rebuild and commit `dist/index.mjs` after any change to `src/`.
+All runtime dependencies (Langfuse SDK, OpenTelemetry, zod) are bundled into the single `dist/index.mjs`; only Node.js built-ins (which Bun provides) stay external. Rebuild and commit `dist/index.mjs` after any change to `src/`.
 
 ## Troubleshooting
 

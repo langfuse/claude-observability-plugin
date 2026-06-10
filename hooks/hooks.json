@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/index.mjs\"",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}/dist/index.mjs\"",
             "timeout": 30
           }
         ]

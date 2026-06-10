@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import { buildTurns } from "../src/parse.js";
 import type { TranscriptRow } from "../src/types.js";

@@ -1,7 +1,7 @@
 {
   "name": "langfuse",
   "description": "The Langfuse x Claude Code Observability Plugin",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "author": {
     "name": "Langfuse"
   },

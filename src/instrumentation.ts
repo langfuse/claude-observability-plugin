@@ -14,7 +14,9 @@ export type Instrumentation = {
  * We register a dedicated `NodeTracerProvider` (rather than the full auto-
  * instrumenting `NodeSDK`) so the bundle stays small and free of dynamic
  * instrumentation loading. Registering the provider also installs the
- * AsyncLocalStorage context manager that `propagateAttributes` relies on.
+ * AsyncLocalStorage context manager that `propagateAttributes` relies on;
+ * Bun implements `node:async_hooks` AsyncLocalStorage, so context propagation
+ * works under the Bun runtime the hook ships on.
  *
  * We use `exportMode: "batched"` and flush once at the end: the whole
  * transcript is converted in-process, so batching every span into one (or a
