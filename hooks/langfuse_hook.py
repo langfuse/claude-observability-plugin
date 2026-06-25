@@ -415,6 +415,23 @@ class Turn:
     # belongs to, taken from isMeta rows carrying sourceToolUseID.
     injected_by_tool_id: Dict[str, str]
 
+
+def merge_assistant_content(base: Dict[str, Any], extra: Dict[str, Any]) -> None:
+    """
+    Append extra's content blocks onto bases's, in place.
+    Claude Code emits one logical assistant message (shared message.id) as several transcript rows.
+    We keep the first row as base and concatenate later rows' content blocks so all tool_use blocks
+    are preserved. Text/usage already match across rows, so base's metadata (model, usage, timestamp)
+    is left untouched.
+    """
+    
+    bc = get_content(base)
+    ec = get_content(extra)
+    if not isinstance(bc, list) or not isinstance(ec, list):
+        return
+    bc.extend(ec)
+
+
 def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
     """
     Groups incremental transcript rows into turns:
@@ -493,7 +510,14 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             mid = get_message_id(msg) or f"noid:{len(assistant_order)}"
             if mid not in assistant_latest:
                 assistant_order.append(mid)
-            assistant_latest[mid] = msg
+                assistant_latest[mid] = msg
+            else:
+                # Claude Code splits ONE assistant message (same message.id) across
+                # multiple transcripts row: thinking/text first, then one row per
+                # parallel tool_use (rows can be interleaved with tool_result rows).
+                # "Latest row wins" dropped every parallel toll call but the last
+                # merge the content blocks instead so all tool_uses survive.
+                merge_assistant_content(assistant_latest[mid], msg)
             continue
 
         # ignore unknown rows
