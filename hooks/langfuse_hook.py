@@ -195,21 +195,10 @@ def read_hook_payload() -> Dict[str, Any]:
         return {}
 
 def extract_session_and_transcript(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[Path]]:
-    """
-    Tries a few plausible field names; exact keys can vary across hook types/versions.
-    Prefer structured values from stdin over heuristics.
-    """
-    session_id = (
-        payload.get("sessionId")
-        or payload.get("session_id")
-        or payload.get("session", {}).get("id")
-    )
+    """Read the session id and transcript path from the hook payload."""
+    session_id = payload.get("session_id")
 
-    transcript = (
-        payload.get("transcriptPath")
-        or payload.get("transcript_path")
-        or payload.get("transcript", {}).get("path")
-    )
+    transcript = payload.get("transcript_path")
 
     if transcript:
         try:
