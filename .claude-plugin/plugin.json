@@ -1,7 +1,7 @@
 {
   "name": "langfuse-observability",
   "description": "The Langfuse x Claude Code Observability Plugin",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "author": {
     "name": "Langfuse"
   },
@@ -36,7 +36,7 @@
     "CC_LANGFUSE_DEBUG": {
       "type": "boolean",
       "title": "Debug logging",
-      "description": "Write verbose logs to ~/.claude/state/langfuse_hook.log",
+      "description": "Write verbose logs to stderr",
       "default": false
     },
     "CC_LANGFUSE_MAX_CHARS": {

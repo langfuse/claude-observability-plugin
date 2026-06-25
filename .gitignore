@@ -1,1 +1,12 @@
-__pycache__/
+node_modules/
+*.log
+.DS_Store
+
+# Claude Code writes a per-transcript dedup/state sidecar at runtime.
+*.jsonl.langfuse
+
+# Local debugging
+debug.log
+
+# Note: dist/ is intentionally committed — Claude Code runs the bundled hook
+# directly without an install/build step.
