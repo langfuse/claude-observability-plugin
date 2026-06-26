@@ -466,7 +466,15 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             return
         if not assistant_rows:
             return
-        assistants = [merge_assistant_rows(assistant_rows[mid]) for mid in assistant_order if mid in assistant_rows]
+        # Rebuild one assistant message per message.id, in the order the ids
+        # first appeared. assistant_rows[mid] holds all raw rows that shared that
+        # id; merge_assistant_rows concatenates their content blocks into one.
+        assistants: List[Dict[str, Any]] = []
+        for mid in assistant_order:
+            rows_for_id = assistant_rows.get(mid)
+            if not rows_for_id:
+                continue
+            assistants.append(merge_assistant_rows(rows_for_id))
         turns.append(Turn(
             user_msg=current_user,
             assistant_msgs=assistants,
