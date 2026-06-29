@@ -194,7 +194,7 @@ def read_hook_payload() -> Dict[str, Any]:
         debug(f"read_hook_payload exception: {e!r}")
         return {}
 
-def extract_session_and_transcript(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[Path]]:
+def extract_session_id_and_transcript_path(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[Path]]:
     """
     Tries a few plausible field names; exact keys can vary across hook types/versions.
     Prefer structured values from stdin over heuristics.
@@ -205,15 +205,15 @@ def extract_session_and_transcript(payload: Dict[str, Any]) -> Tuple[Optional[st
         or payload.get("session", {}).get("id")
     )
 
-    transcript = (
+    transcript_path_raw = (
         payload.get("transcriptPath")
         or payload.get("transcript_path")
         or payload.get("transcript", {}).get("path")
     )
 
-    if transcript:
+    if transcript_path_raw:
         try:
-            transcript_path = Path(transcript).expanduser().resolve()
+            transcript_path = Path(transcript_path_raw).expanduser().resolve()
         except Exception:
             transcript_path = None
     else:
@@ -824,7 +824,7 @@ def main() -> int:
         return 0
 
     payload = read_hook_payload()
-    session_id, transcript_path = extract_session_and_transcript(payload)
+    session_id, transcript_path = extract_session_id_and_transcript_path(payload)
 
     if not session_id or not transcript_path:
         # No structured payload; fail open (do not guess)
