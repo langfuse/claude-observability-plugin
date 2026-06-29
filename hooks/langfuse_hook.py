@@ -325,7 +325,7 @@ def get_message_id(msg: Dict[str, Any]) -> Optional[str]:
             return mid
     return None
 
-def parse_ts(value: Any) -> Optional[datetime]:
+def parse_timestamp(value: Any) -> Optional[datetime]:
     """Parse a Claude Code jsonl row timestamp (ISO 8601 with trailing Z)."""
     if isinstance(value, dict):
         value = value.get("timestamp")
@@ -624,12 +624,12 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
     last_assistant = turn.assistant_msgs[-1]
     final_assistant_text, _ = truncate_text(extract_text(get_content_from_row(last_assistant)))
 
-    user_ts = parse_ts(turn.user_msg)
-    last_assistant_ts = parse_ts(last_assistant)
+    user_ts = parse_timestamp(turn.user_msg)
+    last_assistant_ts = parse_timestamp(last_assistant)
     # Pick a turn end_time: latest among final assistant message or any tool result
     candidate_end_ts = [t for t in [last_assistant_ts] if t is not None]
     for tr in turn.tool_results_by_id.values():
-        t = parse_ts(tr)
+        t = parse_timestamp(tr)
         if t is not None:
             candidate_end_ts.append(t)
     turn_end_ts = max(candidate_end_ts) if candidate_end_ts else None
@@ -679,7 +679,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
         prev_tool_results: List[Dict[str, Any]] = []  # populated after each batch, surfaced as next gen's input
 
         for idx, am in enumerate(turn.assistant_msgs):
-            am_ts = parse_ts(am)
+            am_ts = parse_timestamp(am)
             am_text_raw = extract_text(get_content_from_row(am))
             am_text, am_text_meta = truncate_text(am_text_raw)
             model = get_model(am)
@@ -757,7 +757,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
                     out_raw = tr_entry.get("content")
                     out_str = out_raw if isinstance(out_raw, str) else json.dumps(out_raw, ensure_ascii=False)
                     out_trunc, out_meta = truncate_text(out_str)
-                    tr_ts = parse_ts(tr_entry.get("timestamp"))
+                    tr_ts = parse_timestamp(tr_entry.get("timestamp"))
                 else:
                     out_trunc, out_meta, tr_ts = None, None, None
                 if tr_ts is not None:
