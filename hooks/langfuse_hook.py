@@ -222,12 +222,13 @@ def extract_session_and_transcript(payload: Dict[str, Any]) -> Tuple[Optional[st
     return session_id, transcript_path
 
 # ----------------- Transcript parsing helpers -----------------
-def get_content(msg: Dict[str, Any]) -> Any:
-    if not isinstance(msg, dict):
+def get_content_from_row(row: Dict[str, Any]) -> Any:
+    if not isinstance(row, dict):
         return None
-    if "message" in msg and isinstance(msg.get("message"), dict):
-        return msg["message"].get("content")
-    return msg.get("content")
+    message = row.get("message")
+    if isinstance(message, dict):
+        return message.get("content")
+    return row.get("content")
 
 def get_role(msg: Dict[str, Any]) -> Optional[str]:
     # Claude Code transcript lines commonly have type=user/assistant OR message.role
@@ -245,7 +246,7 @@ def is_tool_result(msg: Dict[str, Any]) -> bool:
     role = get_role(msg)
     if role != "user":
         return False
-    content = get_content(msg)
+    content = get_content_from_row(msg)
     if isinstance(content, list):
         return any(isinstance(x, dict) and x.get("type") == "tool_result" for x in content)
     return False
@@ -492,7 +493,7 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             # attach it to that tool span.
             src = msg.get("sourceToolUseID")
             if src:
-                txt = extract_text(get_content(msg))
+                txt = extract_text(get_content_from_row(msg))
                 if txt:
                     injected_by_tool_id[str(src)] = txt
             continue
@@ -502,7 +503,7 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
         # tool_result rows show up as role=user with content blocks of type tool_result
         if is_tool_result(msg):
             row_ts = msg.get("timestamp")
-            for tr in iter_tool_results(get_content(msg)):
+            for tr in iter_tool_results(get_content_from_row(msg)):
                 tid = tr.get("tool_use_id")
                 if tid:
                     tool_results_by_id[str(tid)] = {"content": tr.get("content"), "timestamp": row_ts}
@@ -588,7 +589,7 @@ def collect_skill_tags(turn: Turn) -> List[str]:
     """Return 'skill:<name>' tags for every Skill tool invocation in the turn."""
     names: List[str] = []
     for am in turn.assistant_msgs:
-        for tu in iter_tool_uses(get_content(am)):
+        for tu in iter_tool_uses(get_content_from_row(am)):
             if tu.get("name") != "Skill":
                 continue
             tu_input = tu.get("input")
@@ -615,11 +616,11 @@ def trace_display_name(session_id: str, turn_num: int) -> str:
 
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
               user_id: Optional[str] = None) -> None:
-    user_text_raw = extract_text(get_content(turn.user_msg))
+    user_text_raw = extract_text(get_content_from_row(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
 
     last_assistant = turn.assistant_msgs[-1]
-    final_assistant_text, _ = truncate_text(extract_text(get_content(last_assistant)))
+    final_assistant_text, _ = truncate_text(extract_text(get_content_from_row(last_assistant)))
 
     user_ts = parse_ts(turn.user_msg)
     last_assistant_ts = parse_ts(last_assistant)
@@ -677,10 +678,10 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
 
         for idx, am in enumerate(turn.assistant_msgs):
             am_ts = parse_ts(am)
-            am_text_raw = extract_text(get_content(am))
+            am_text_raw = extract_text(get_content_from_row(am))
             am_text, am_text_meta = truncate_text(am_text_raw)
             model = get_model(am)
-            tool_uses = iter_tool_uses(get_content(am))
+            tool_uses = iter_tool_uses(get_content_from_row(am))
 
             # Build generation input: user message for first generation, otherwise tool results from
             # the prior batch (best partial reconstruction of the prompt context).
