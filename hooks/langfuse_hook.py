@@ -230,20 +230,22 @@ def get_content_from_row(row: Dict[str, Any]) -> Any:
         return message.get("content")
     return row.get("content")
 
-def get_role(msg: Dict[str, Any]) -> Optional[str]:
-    # Claude Code transcript lines commonly have type=user/assistant OR message.role
-    t = msg.get("type")
-    if t in ("user", "assistant"):
-        return t
-    m = msg.get("message")
-    if isinstance(m, dict):
-        r = m.get("role")
-        if r in ("user", "assistant"):
-            return r
+def get_user_or_assistant_role_from_row(row: Dict[str, Any]) -> Optional[str]:
+    # Claude Code transcript row format is internal. Prefer top-level row.type
+    # when it marks a chat row, then fall back to nested message.role.
+    row_type = row.get("type")
+    if row_type in ("user", "assistant"):
+        return row_type
+
+    message = row.get("message")
+    if isinstance(message, dict):
+        role = message.get("role")
+        if role in ("user", "assistant"):
+            return role
     return None
 
 def is_tool_result(msg: Dict[str, Any]) -> bool:
-    role = get_role(msg)
+    role = get_user_or_assistant_role_from_row(msg)
     if role != "user":
         return False
     content = get_content_from_row(msg)
@@ -498,7 +500,7 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
                     injected_by_tool_id[str(src)] = txt
             continue
 
-        role = get_role(msg)
+        role = get_user_or_assistant_role_from_row(msg)
 
         # tool_result rows show up as role=user with content blocks of type tool_result
         if is_tool_result(msg):
