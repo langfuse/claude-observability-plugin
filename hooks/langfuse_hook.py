@@ -457,24 +457,24 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
     current_user: Optional[Dict[str, Any]] = None
 
     # assistant messages for current turn:
-    assistant_order: List[str] = []             # message ids in order of first appearance (or synthetic)
-    assistant_rows: Dict[str, List[Dict[str, Any]]] = {}  # id -> all rows (merged at flush)
+    assistant_message_ids: List[str] = []             # message ids in order of first appearance (or synthetic)
+    assistant_rows_by_message_id: Dict[str, List[Dict[str, Any]]] = {}  # id -> all rows (merged at flush)
 
     tool_results_by_id: Dict[str, Any] = {}     # tool_use_id -> content
     injected_by_tool_id: Dict[str, str] = {}    # tool_use_id -> injected text (skill instructions)
 
     def flush_turn():
-        nonlocal current_user, assistant_order, assistant_rows, tool_results_by_id, injected_by_tool_id, turns
+        nonlocal current_user, assistant_message_ids, assistant_rows_by_message_id, tool_results_by_id, injected_by_tool_id, turns
         if current_user is None:
             return
-        if not assistant_rows:
+        if not assistant_rows_by_message_id:
             return
         # Rebuild one assistant message per message.id, in the order the ids
-        # first appeared. assistant_rows[mid] holds all raw rows that shared that
+        # first appeared. assistant_rows_by_message_id[message_id] holds all raw rows that shared that
         # id; merge_assistant_rows concatenates their content blocks into one.
         assistants: List[Dict[str, Any]] = []
-        for mid in assistant_order:
-            rows_for_id = assistant_rows.get(mid)
+        for message_id in assistant_message_ids:
+            rows_for_id = assistant_rows_by_message_id.get(message_id)
             if not rows_for_id:
                 continue
             assistants.append(merge_assistant_rows(rows_for_id))
@@ -485,27 +485,27 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             injected_by_tool_id=dict(injected_by_tool_id),
         ))
 
-    for msg in messages:
+    for row in messages:
         # Injected user rows (slash-command expansions, caveats, skill instructions)
         # carry isMeta=true. They are not real prompts — treating them as turn starts
         # creates phantom turns and prematurely flushes the real one.
-        if msg.get("isMeta"):
+        if row.get("isMeta"):
             # Skill invocations link their injected instructions to the originating
             # tool_use via sourceToolUseID; keep the text so emit can optionally
             # attach it to that tool span.
-            src = msg.get("sourceToolUseID")
+            src = row.get("sourceToolUseID")
             if src:
-                txt = extract_text(get_content_from_row(msg))
+                txt = extract_text(get_content_from_row(row))
                 if txt:
                     injected_by_tool_id[str(src)] = txt
             continue
 
-        role = get_user_or_assistant_role_from_row(msg)
+        role = get_user_or_assistant_role_from_row(row)
 
         # tool_result rows show up as role=user with content blocks of type tool_result
-        if is_tool_result(msg):
-            row_ts = msg.get("timestamp")
-            for tr in get_tool_result_blocks(get_content_from_row(msg)):
+        if is_tool_result(row):
+            row_ts = row.get("timestamp")
+            for tr in get_tool_result_blocks(get_content_from_row(row)):
                 tid = tr.get("tool_use_id")
                 if tid:
                     tool_results_by_id[str(tid)] = {"content": tr.get("content"), "timestamp": row_ts}
@@ -516,9 +516,9 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             flush_turn()
 
             # start a new turn
-            current_user = msg
-            assistant_order = []
-            assistant_rows = {}
+            current_user = row
+            assistant_message_ids = []
+            assistant_rows_by_message_id = {}
             tool_results_by_id = {}
             injected_by_tool_id = {}
             continue
@@ -528,11 +528,11 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
                 # ignore assistant rows until we see a user message
                 continue
 
-            mid = get_message_id(msg) or f"noid:{len(assistant_order)}"
-            if mid not in assistant_rows:
-                assistant_order.append(mid)
-                assistant_rows[mid] = []
-            assistant_rows[mid].append(msg)
+            message_id = get_message_id(row) or f"noid:{len(assistant_message_ids)}"
+            if message_id not in assistant_rows_by_message_id:
+                assistant_message_ids.append(message_id)
+                assistant_rows_by_message_id[message_id] = []
+            assistant_rows_by_message_id[message_id].append(row)
             continue
 
         # ignore unknown rows
