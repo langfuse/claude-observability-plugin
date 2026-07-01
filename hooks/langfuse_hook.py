@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -342,13 +342,18 @@ class SessionState:
     offset: int = 0       # Last byte read from the transcript file.
     buffer: str = ""      # Partial JSONL line kept between hook runs.
     turn_count: int = 0   # Turns already emitted for this session.
+    pending_agent_turns: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
 
 def load_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
+    pending = s.get("pending_agent_turns")
+    if not isinstance(pending, dict):
+        pending = {}
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
         turn_count=int(s.get("turn_count", 0)),
+        pending_agent_turns=pending,
     )
 
 def write_session_state(global_state: Dict[str, Any], key: str, ss: SessionState) -> None:
@@ -356,6 +361,7 @@ def write_session_state(global_state: Dict[str, Any], key: str, ss: SessionState
         "offset": ss.offset,
         "buffer": ss.buffer,
         "turn_count": ss.turn_count,
+        "pending_agent_turns": ss.pending_agent_turns or {},
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -414,9 +420,91 @@ class Turn:
     user_msg: Dict[str, Any]
     assistant_msgs: List[Dict[str, Any]]
     tool_results_by_id: Dict[str, Any]
+    tool_use_timestamps_by_id: Dict[str, Any]
     # Injected context (e.g. skill instructions) keyed by the tool_use id it
     # belongs to, taken from isMeta rows carrying sourceToolUseID.
     injected_by_tool_id: Dict[str, str]
+    rows: List[Dict[str, Any]]
+
+def _extract_xml_tag_value(text: str, tag: str) -> Optional[str]:
+    start = f"<{tag}>"
+    end = f"</{tag}>"
+    i = text.find(start)
+    if i < 0:
+        return None
+    j = text.find(end, i + len(start))
+    if j < 0:
+        return None
+    return text[i + len(start):j]
+
+def get_tool_use_id_from_task_notification(row: Dict[str, Any]) -> Optional[str]:
+    notification_text = extract_text(get_content_from_row(row)).lstrip()
+    if not notification_text.startswith("<task-notification>"):
+        return None
+    tool_use_id = _extract_xml_tag_value(notification_text, "tool-use-id")
+    return tool_use_id.strip() if isinstance(tool_use_id, str) and tool_use_id.strip() else None
+
+def get_result_from_task_notification_row(row: Dict[str, Any]) -> str:
+    notification_text = extract_text(get_content_from_row(row))
+    result = _extract_xml_tag_value(notification_text, "result")
+    return result if result is not None else notification_text
+
+def get_pending_agent_tool_use_ids(turn: Turn) -> List[str]:
+    tool_use_ids: List[str] = []
+    for assistant_message in turn.assistant_msgs:
+        for tool_use_block in get_tool_use_blocks(get_content_from_row(assistant_message)):
+            if tool_use_block.get("name") not in ("Agent", "Task"):
+                continue
+            tool_use_id = str(tool_use_block.get("id") or "")
+            if not tool_use_id:
+                continue
+            tool_result_entry = turn.tool_results_by_id.get(tool_use_id)
+            if isinstance(tool_result_entry, dict) and tool_result_entry.get("final_content") is not None:
+                continue
+            tool_result_content = tool_result_entry.get("content") if isinstance(tool_result_entry, dict) else None
+            tool_result_text = tool_result_content if isinstance(tool_result_content, str) else json.dumps(tool_result_content, ensure_ascii=False)
+            if "Async agent launched successfully" in tool_result_text:
+                tool_use_ids.append(tool_use_id)
+    return tool_use_ids
+
+def prepend_deferred_agent_turn_rows(messages: List[Dict[str, Any]], ss: SessionState) -> List[Dict[str, Any]]:
+    if not ss.pending_agent_turns:
+        return messages
+    rows: List[Dict[str, Any]] = []
+    for row in messages:
+        tool_use_id = get_tool_use_id_from_task_notification(row)
+        if tool_use_id and tool_use_id in ss.pending_agent_turns:
+            rows.extend(ss.pending_agent_turns.pop(tool_use_id))
+        rows.append(row)
+    return rows
+
+def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
+    """Map launching Agent/Task tool_use ids to their subagent transcripts."""
+    subagent_dir = transcript_path.with_suffix("") / "subagents"
+    if not subagent_dir.is_dir():
+        return {}
+
+    subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]] = {}
+    for meta_path in subagent_dir.glob("*.meta.json"):
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        tool_use_id = metadata.get("toolUseId")
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            continue
+
+        jsonl_path = meta_path.with_name(meta_path.name[: -len(".meta.json")] + ".jsonl")
+        if not jsonl_path.exists():
+            continue
+
+        subagent_transcripts_by_tool_use_id[tool_use_id] = {
+            "path": jsonl_path,
+            "agent_type": metadata.get("agentType"),
+            "description": metadata.get("description"),
+        }
+    return subagent_transcripts_by_tool_use_id
 
 def merge_assistant_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -461,10 +549,12 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
     assistant_rows_by_message_id: Dict[str, List[Dict[str, Any]]] = {}  # id -> all rows (merged at flush)
 
     tool_results_by_id: Dict[str, Any] = {}     # tool_use_id -> content
+    tool_use_timestamps_by_id: Dict[str, Any] = {}  # tool_use_id -> row timestamp
     injected_by_tool_id: Dict[str, str] = {}    # tool_use_id -> injected text (skill instructions)
+    current_rows: List[Dict[str, Any]] = []
 
     def flush_turn():
-        nonlocal current_turn_user_row, assistant_message_ids, assistant_rows_by_message_id, tool_results_by_id, injected_by_tool_id, turns
+        nonlocal current_turn_user_row, assistant_message_ids, assistant_rows_by_message_id, tool_results_by_id, tool_use_timestamps_by_id, injected_by_tool_id, current_rows, turns
         if current_turn_user_row is None:
             return
         if not assistant_rows_by_message_id:
@@ -482,7 +572,9 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             user_msg=current_turn_user_row,
             assistant_msgs=merged_assistant_rows,
             tool_results_by_id=dict(tool_results_by_id),
+            tool_use_timestamps_by_id=dict(tool_use_timestamps_by_id),
             injected_by_tool_id=dict(injected_by_tool_id),
+            rows=list(current_rows),
         ))
 
     for row in messages:
@@ -498,17 +590,37 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
                 txt = extract_text(get_content_from_row(row))
                 if txt:
                     injected_by_tool_id[str(src)] = txt
+                    current_rows.append(row)
             continue
 
         role = get_user_or_assistant_role_from_row(row)
 
         # tool_result rows show up as role=user with content blocks of type tool_result
         if is_tool_result(row):
+            current_rows.append(row)
             row_ts = row.get("timestamp")
             for tr in get_tool_result_blocks(get_content_from_row(row)):
                 tid = tr.get("tool_use_id")
                 if tid:
                     tool_results_by_id[str(tid)] = {"content": tr.get("content"), "timestamp": row_ts}
+            continue
+
+        task_tid = get_tool_use_id_from_task_notification(row)
+        if task_tid:
+            if current_turn_user_row is not None:
+                existing_result = tool_results_by_id.get(task_tid)
+                if isinstance(existing_result, dict):
+                    existing_result["final_content"] = get_result_from_task_notification_row(row)
+                    existing_result["final_timestamp"] = row.get("timestamp")
+                else:
+                    tool_results_by_id[task_tid] = {
+                        "content": get_result_from_task_notification_row(row),
+                        "timestamp": row.get("timestamp"),
+                    }
+                current_rows.append(row)
+            else:
+                current_turn_user_row = row
+                current_rows = [row]
             continue
 
         if role == "user":
@@ -520,7 +632,9 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             assistant_message_ids = []
             assistant_rows_by_message_id = {}
             tool_results_by_id = {}
+            tool_use_timestamps_by_id = {}
             injected_by_tool_id = {}
+            current_rows = [row]
             continue
 
         if role == "assistant":
@@ -533,6 +647,11 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
                 assistant_message_ids.append(message_id)
                 assistant_rows_by_message_id[message_id] = []
             assistant_rows_by_message_id[message_id].append(row)
+            for tool_use_block in get_tool_use_blocks(get_content_from_row(row)):
+                tool_use_id = tool_use_block.get("id")
+                if tool_use_id:
+                    tool_use_timestamps_by_id.setdefault(str(tool_use_id), row.get("timestamp"))
+            current_rows.append(row)
             continue
 
         # ignore unknown rows
@@ -616,8 +735,296 @@ def trace_display_name(session_id: str, turn_num: int) -> str:
     return f"Claude Code - Turn {turn_num} ({short_session_label(session_id)})"
 
 
+def _get_latest_timestamp(*timestamps: Optional[datetime]) -> Optional[datetime]:
+    present_timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
+    return max(present_timestamps) if present_timestamps else None
+
+
+def emit_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn,
+                      start_ts: Optional[datetime],
+                      generation_prefix: str = "Claude Generation",
+                      subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[datetime]:
+    """Emit a turn's generations and tool observations under an existing span."""
+    user_text, _ = truncate_text(extract_text(get_content_from_row(turn.user_msg)))
+    prev_ts = start_ts
+    prev_tool_results: List[Dict[str, Any]] = []
+    pending_async_tool_results: List[Dict[str, Any]] = []
+    pending_subagents: List[Dict[str, Any]] = []
+    latest_end = start_ts
+
+    for idx, am in enumerate(turn.assistant_msgs):
+        am_ts = parse_timestamp(am)
+        am_text_raw = extract_text(get_content_from_row(am))
+        am_text, am_text_meta = truncate_text(am_text_raw)
+        model = get_model(am)
+        tool_uses = get_tool_use_blocks(get_content_from_row(am))
+        ready_subagents: List[Dict[str, Any]] = []
+        if idx > 0 and pending_subagents:
+            still_pending_subagents: List[Dict[str, Any]] = []
+            for pending_subagent in pending_subagents:
+                ready_ts = pending_subagent.get("ready_timestamp")
+                if isinstance(ready_ts, datetime) and (am_ts is None or ready_ts <= am_ts):
+                    ready_subagents.append(pending_subagent)
+                else:
+                    still_pending_subagents.append(pending_subagent)
+            pending_subagents = still_pending_subagents
+            for ready_subagent in ready_subagents:
+                subagent_end_ts = emit_subagent_observations(
+                    langfuse,
+                    parent_otel_span,
+                    ready_subagent["subagent"],
+                    ready_subagent.get("start_timestamp"),
+                )
+                latest_end = _get_latest_timestamp(latest_end, subagent_end_ts)
+
+        ready_async_tool_results: List[Dict[str, Any]] = []
+        if idx > 0 and pending_async_tool_results:
+            still_pending: List[Dict[str, Any]] = []
+            for async_result in pending_async_tool_results:
+                async_ts = async_result.get("timestamp")
+                if isinstance(async_ts, datetime) and (am_ts is None or async_ts <= am_ts):
+                    ready_async_tool_results.append(async_result)
+                else:
+                    still_pending.append(async_result)
+            pending_async_tool_results = still_pending
+            if ready_async_tool_results:
+                ready_ts = _get_latest_timestamp(*[
+                    result.get("timestamp") for result in ready_async_tool_results
+                    if isinstance(result.get("timestamp"), datetime)
+                ])
+                prev_ts = _get_latest_timestamp(prev_ts, ready_ts)
+
+        if idx == 0:
+            gen_input: Any = {"role": "user", "content": user_text}
+        elif prev_tool_results:
+            gen_input = {"role": "tool", "tool_results": prev_tool_results}
+        elif ready_async_tool_results:
+            gen_input = {
+                "role": "tool",
+                "tool_results": [result["tool_result"] for result in ready_async_tool_results],
+            }
+        else:
+            gen_input = None
+
+        gen_tool_calls = []
+        for tu in tool_uses:
+            gen_tool_calls.append({
+                "id": tu.get("id"),
+                "name": tu.get("name"),
+            })
+
+        gen_output: Dict[str, Any] = {"role": "assistant"}
+        if am_text:
+            gen_output["content"] = am_text
+        if gen_tool_calls:
+            gen_output["tool_calls"] = gen_tool_calls
+
+        gen_kwargs: Dict[str, Any] = dict(
+            model=model,
+            input=gen_input,
+            output=gen_output,
+            metadata={
+                "assistant_index": idx,
+                "assistant_text": am_text_meta,
+                "tool_count": len(tool_uses),
+            },
+        )
+        usage_details = get_usage_details_from_row(am)
+        if usage_details is not None:
+            gen_kwargs["usage_details"] = usage_details
+
+        gen_span = _start_backdated(
+            langfuse,
+            name=f"{generation_prefix} {idx + 1}",
+            as_type="generation",
+            start_time=prev_ts or am_ts,
+            parent_otel_span=parent_otel_span,
+            **gen_kwargs,
+        )
+
+        batch_result_ts: List[datetime] = []
+        batch_tool_results: List[Dict[str, Any]] = []
+        for tu in tool_uses:
+            tid = str(tu.get("id") or "")
+            tname = tu.get("name") or "unknown"
+            tinput_raw = tu.get("input") if isinstance(tu.get("input"), (dict, list, str, int, float, bool)) else {}
+            if isinstance(tinput_raw, str):
+                tinput, tinput_meta = truncate_text(tinput_raw)
+            else:
+                tinput, tinput_meta = tinput_raw, None
+
+            tr_entry = turn.tool_results_by_id.get(tid) if tid else None
+            if tr_entry:
+                out_raw = tr_entry.get("content")
+                out_str = out_raw if isinstance(out_raw, str) else json.dumps(out_raw, ensure_ascii=False)
+                out_trunc, out_meta = truncate_text(out_str)
+                tr_ts = parse_timestamp(tr_entry.get("timestamp"))
+                final_out_raw = tr_entry.get("final_content")
+                if final_out_raw is not None:
+                    final_out_str = final_out_raw if isinstance(final_out_raw, str) else json.dumps(final_out_raw, ensure_ascii=False)
+                    final_out_trunc, final_out_meta = truncate_text(final_out_str)
+                    final_tr_ts = parse_timestamp(tr_entry.get("final_timestamp"))
+                else:
+                    final_out_trunc, final_out_meta, final_tr_ts = None, None, None
+            else:
+                out_trunc, out_meta, tr_ts = None, None, None
+                final_out_trunc, final_out_meta, final_tr_ts = None, None, None
+
+            tool_output_trunc = out_trunc
+            tool_output_meta = out_meta
+            tool_output: Any = tool_output_trunc
+            if CAPTURE_SKILL_CONTENT:
+                injected = turn.injected_by_tool_id.get(tid) if tid else None
+                if injected:
+                    injected_trunc, _ = truncate_text(injected)
+                    tool_output = {"result": tool_output_trunc, "injected_instructions": injected_trunc}
+
+            sub = subagent_transcripts_by_tool_use_id.get(tid) if subagent_transcripts_by_tool_use_id and tid else None
+            tool_meta: Dict[str, Any] = {
+                "tool_name": tname,
+                "tool_id": tid,
+                "input_meta": tinput_meta,
+                "output_meta": tool_output_meta,
+            }
+            if sub:
+                tool_meta.update({
+                    "subagent_type": sub.get("agent_type"),
+                    "subagent_description": sub.get("description"),
+                    "subagent_transcript_path": str(sub.get("path")),
+                })
+
+            tool_use_ts = parse_timestamp(turn.tool_use_timestamps_by_id.get(tid)) or am_ts
+            tool_span = _start_backdated(
+                langfuse,
+                name=f"Tool: {tname}",
+                as_type="tool",
+                start_time=tool_use_ts,
+                parent_otel_span=parent_otel_span,
+                input=tinput,
+                metadata=tool_meta,
+            )
+            tool_span.update(output=tool_output)
+
+            subagent_end_ts = None
+            if sub:
+                if final_tr_ts is not None:
+                    pending_subagents.append({
+                        "subagent": sub,
+                        "start_timestamp": tool_use_ts,
+                        "ready_timestamp": final_tr_ts,
+                    })
+                else:
+                    subagent_end_ts = emit_subagent_observations(langfuse, parent_otel_span, sub, tool_use_ts)
+
+            tool_end_ts = _get_latest_timestamp(tr_ts, tool_use_ts)
+            handoff_ts = tr_ts or final_tr_ts or subagent_end_ts or am_ts
+            if handoff_ts is not None:
+                batch_result_ts.append(handoff_ts)
+            tool_span.end(end_time=_to_ns(tool_end_ts))
+            latest_end = _get_latest_timestamp(latest_end, tool_end_ts, subagent_end_ts)
+
+            batch_tool_results.append({
+                "tool_use_id": tid,
+                "tool_name": tname,
+                "output": out_trunc,
+            })
+            if final_tr_ts is not None and final_out_trunc is not None:
+                pending_async_tool_results.append({
+                    "timestamp": final_tr_ts,
+                    "tool_result": {
+                        "tool_use_id": tid,
+                        "tool_name": tname,
+                        "output": final_out_trunc,
+                    },
+                })
+
+        gen_end_ts = max(batch_result_ts) if batch_result_ts else am_ts
+        gen_span.end(end_time=_to_ns(gen_end_ts or am_ts or prev_ts))
+        latest_end = _get_latest_timestamp(latest_end, gen_end_ts)
+
+        prev_tool_results = batch_tool_results
+        if batch_result_ts:
+            prev_ts = max(batch_result_ts)
+        elif am_ts is not None:
+            prev_ts = am_ts
+
+    for pending_subagent in pending_subagents:
+        subagent_end_ts = emit_subagent_observations(
+            langfuse,
+            parent_otel_span,
+            pending_subagent["subagent"],
+            pending_subagent.get("start_timestamp"),
+        )
+        latest_end = _get_latest_timestamp(latest_end, subagent_end_ts)
+
+    return latest_end
+
+
+def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
+                               subagent: Dict[str, Any],
+                               start_ts: Optional[datetime]) -> Optional[datetime]:
+    path = subagent.get("path")
+    if not isinstance(path, Path):
+        return start_ts
+    try:
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except Exception as e:
+        info(f"subagent transcript read failed ({path}): {type(e).__name__}: {e}")
+        return start_ts
+
+    turns = build_turns(rows)
+    if not turns:
+        return start_ts
+
+    first_turn = turns[0]
+    subagent_start_ts = parse_timestamp(first_turn.user_msg) or start_ts
+    subagent_input_text, subagent_input_meta = truncate_text(extract_text(get_content_from_row(first_turn.user_msg)))
+
+    last_turn = turns[-1]
+    last_assistant = last_turn.assistant_msgs[-1]
+    subagent_output_text, _ = truncate_text(extract_text(get_content_from_row(last_assistant)))
+
+    description = subagent.get("description")
+    subagent_name = f"Subagent: {description}" if isinstance(description, str) and description else "Subagent"
+    subagent_span = _start_backdated(
+        langfuse,
+        name=subagent_name,
+        as_type="span",
+        start_time=subagent_start_ts,
+        parent_otel_span=parent_otel_span,
+        input={"role": "user", "content": subagent_input_text},
+        metadata={
+            "agent_type": subagent.get("agent_type"),
+            "description": description,
+            "transcript_path": str(path),
+            "user_text": subagent_input_meta,
+        },
+    )
+
+    latest_end = subagent_start_ts
+    prev_start = subagent_start_ts
+    for turn in turns:
+        latest = emit_observations(
+            langfuse,
+            subagent_span._otel_span,
+            turn,
+            prev_start,
+            generation_prefix="Subagent Generation",
+            subagent_transcripts_by_tool_use_id=None,
+        )
+        latest_end = _get_latest_timestamp(latest_end, latest)
+        if latest is not None:
+            prev_start = latest
+
+    subagent_span.update(output={"role": "assistant", "content": subagent_output_text})
+    subagent_span.end(end_time=_to_ns(_get_latest_timestamp(latest_end, subagent_start_ts)))
+
+    return latest_end
+
+
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
-              user_id: Optional[str] = None) -> None:
+              user_id: Optional[str] = None,
+              subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
     user_text_raw = extract_text(get_content_from_row(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
 
@@ -670,147 +1077,15 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
             input={"role": "user", "content": user_text},
             metadata=trace_metadata,
         )
-        parent_otel_span = trace_span._otel_span
-
-        # Iterate each assistant message: emit generation, then its tool_use children.
-        # prev_ts = the moment the next generation could have started (= when the previous
-        # batch of tool results all returned, or the original user message timestamp).
-        prev_ts = user_ts
-        prev_tool_results: List[Dict[str, Any]] = []  # populated after each batch, surfaced as next gen's input
-
-        for idx, am in enumerate(turn.assistant_msgs):
-            am_ts = parse_timestamp(am)
-            am_text_raw = extract_text(get_content_from_row(am))
-            am_text, am_text_meta = truncate_text(am_text_raw)
-            model = get_model(am)
-            tool_uses = get_tool_use_blocks(get_content_from_row(am))
-
-            # Build generation input: user message for first generation, otherwise tool results from
-            # the prior batch (best partial reconstruction of the prompt context).
-            if idx == 0:
-                gen_input: Any = {"role": "user", "content": user_text}
-            elif prev_tool_results:
-                gen_input = {"role": "tool", "tool_results": prev_tool_results}
-            else:
-                gen_input = None
-
-            # Build generation output: include both the text response and any tool calls the LLM
-            # decided to make. Most assistant messages in tool-using turns are tool-call-only, so
-            # without tool_calls in the output, the observation looks empty.
-            gen_tool_calls = []
-            for tu in tool_uses:
-                tu_input = tu.get("input")
-                if isinstance(tu_input, str):
-                    tu_input_serialized, _ = truncate_text(tu_input)
-                else:
-                    tu_input_serialized = tu_input
-                gen_tool_calls.append({
-                    "id": tu.get("id"),
-                    "name": tu.get("name"),
-                    "input": tu_input_serialized,
-                })
-
-            gen_output: Dict[str, Any] = {"role": "assistant"}
-            if am_text:
-                gen_output["content"] = am_text
-            if gen_tool_calls:
-                gen_output["tool_calls"] = gen_tool_calls
-
-            gen_kwargs: Dict[str, Any] = dict(
-                model=model,
-                input=gen_input,
-                output=gen_output,
-                metadata={
-                    "assistant_index": idx,
-                    "assistant_text": am_text_meta,
-                    "tool_count": len(tool_uses),
-                },
-            )
-            usage_details = get_usage_details_from_row(am)
-            if usage_details is not None:
-                gen_kwargs["usage_details"] = usage_details
-
-            gen_span = _start_backdated(
-                langfuse,
-                name=f"Claude Generation {idx + 1}",
-                as_type="generation",
-                start_time=prev_ts or am_ts,
-                parent_otel_span=parent_otel_span,
-                **gen_kwargs,
-            )
-
-            # Tool observations: nested under this generation. Each starts when the assistant
-            # emitted the tool_use (am_ts) and ends when its tool_result row arrived.
-            batch_result_ts: List[datetime] = []
-            batch_tool_results: List[Dict[str, Any]] = []
-            for tu in tool_uses:
-                tid = str(tu.get("id") or "")
-                tname = tu.get("name") or "unknown"
-                tinput_raw = tu.get("input") if isinstance(tu.get("input"), (dict, list, str, int, float, bool)) else {}
-                if isinstance(tinput_raw, str):
-                    tinput, tinput_meta = truncate_text(tinput_raw)
-                else:
-                    tinput, tinput_meta = tinput_raw, None
-
-                tr_entry = turn.tool_results_by_id.get(tid) if tid else None
-                if tr_entry:
-                    out_raw = tr_entry.get("content")
-                    out_str = out_raw if isinstance(out_raw, str) else json.dumps(out_raw, ensure_ascii=False)
-                    out_trunc, out_meta = truncate_text(out_str)
-                    tr_ts = parse_timestamp(tr_entry.get("timestamp"))
-                else:
-                    out_trunc, out_meta, tr_ts = None, None, None
-                if tr_ts is not None:
-                    batch_result_ts.append(tr_ts)
-
-                # Skill invocations inject their instructions as a separate transcript
-                # row; optionally surface them on the tool span they belong to.
-                tool_output: Any = out_trunc
-                if CAPTURE_SKILL_CONTENT:
-                    injected = turn.injected_by_tool_id.get(tid) if tid else None
-                    if injected:
-                        injected_trunc, _ = truncate_text(injected)
-                        tool_output = {"result": out_trunc, "injected_instructions": injected_trunc}
-
-                tool_span = _start_backdated(
-                    langfuse,
-                    name=f"Tool: {tname}",
-                    as_type="tool",
-                    start_time=am_ts,
-                    parent_otel_span=gen_span._otel_span,
-                    input=tinput,
-                    metadata={
-                        "tool_name": tname,
-                        "tool_id": tid,
-                        "input_meta": tinput_meta,
-                        "output_meta": out_meta,
-                    },
-                )
-                tool_span.update(output=tool_output)
-                tool_span.end(end_time=_to_ns(tr_ts or am_ts))
-
-                batch_tool_results.append({
-                    "tool_use_id": tid,
-                    "tool_name": tname,
-                    "output": out_trunc,
-                })
-
-            # End the generation AFTER its tools so the timeline cleanly contains them.
-            # If there were tool calls, gen ends with the last result; otherwise at am_ts.
-            gen_end_ts = max(batch_result_ts) if batch_result_ts else am_ts
-            gen_span.end(end_time=_to_ns(gen_end_ts or am_ts or prev_ts))
-
-            # Carry this batch's results into the next generation's input.
-            prev_tool_results = batch_tool_results
-
-            # Advance prev_ts: next generation can only start after this batch's tool results returned.
-            if batch_result_ts:
-                prev_ts = max(batch_result_ts)
-            elif am_ts is not None:
-                prev_ts = am_ts
-
+        obs_end_ts = emit_observations(
+            langfuse,
+            trace_span._otel_span,
+            turn,
+            user_ts,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+        )
         trace_span.update(output={"role": "assistant", "content": final_assistant_text})
-        trace_span.end(end_time=_to_ns(turn_end_ts or last_assistant_ts or user_ts))
+        trace_span.end(end_time=_to_ns(_get_latest_timestamp(turn_end_ts, last_assistant_ts, obs_end_ts, user_ts)))
 
 # ----------------- Main -----------------
 def main() -> int:
@@ -855,19 +1130,35 @@ def main() -> int:
                 save_state(state)
                 return 0
 
+            msgs = prepend_deferred_agent_turn_rows(msgs, ss)
             turns = build_turns(msgs)
             if not turns:
                 write_session_state(state, key, ss)
                 save_state(state)
                 return 0
 
+            subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
+            if subagent_transcripts_by_tool_use_id:
+                debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
+
+            turns_to_emit: List[Turn] = []
+            for t in turns:
+                pending_agent_tool_use_ids = get_pending_agent_tool_use_ids(t)
+                if pending_agent_tool_use_ids:
+                    for tool_use_id in pending_agent_tool_use_ids:
+                        ss.pending_agent_turns[tool_use_id] = t.rows
+                    debug(f"Deferred agent turn until task notification: {pending_agent_tool_use_ids}")
+                    continue
+                turns_to_emit.append(t)
+
             # emit turns
             emitted = 0
-            for t in turns:
+            for t in turns_to_emit:
                 emitted += 1
                 turn_num = ss.turn_count + emitted
                 try:
-                    emit_turn(langfuse, session_id, turn_num, t, transcript_path, user_id=user_id)
+                    emit_turn(langfuse, session_id, turn_num, t, transcript_path,
+                              user_id=user_id, subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id)
                 except Exception as e:
                     # Log at INFO so SDK incompatibilities (and other emit failures)
                     # are visible without needing CC_LANGFUSE_DEBUG=true.
