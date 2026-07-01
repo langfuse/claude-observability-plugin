@@ -724,6 +724,28 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
     return turns
 
 
+def get_new_turns_from_transcript(transcript_path: Path, session_state: SessionState) -> Tuple[List[Turn], SessionState]:
+    rows, session_state = read_new_jsonl(transcript_path, session_state)
+    if not rows:
+        return [], session_state
+
+    rows = prepend_deferred_agent_turn_rows(rows, session_state)
+    return build_turns(rows), session_state
+
+
+def get_turns_to_emit(turns: List[Turn], session_state: SessionState) -> List[Turn]:
+    turns_to_emit: List[Turn] = []
+    for turn in turns:
+        pending_agent_tool_use_ids = get_pending_agent_tool_use_ids(turn)
+        if pending_agent_tool_use_ids:
+            for tool_use_id in pending_agent_tool_use_ids:
+                session_state.pending_agent_turns[tool_use_id] = turn.rows
+            debug(f"Deferred agent turn until task notification: {pending_agent_tool_use_ids}")
+            continue
+        turns_to_emit.append(turn)
+    return turns_to_emit
+
+
 # ----------------- Langfuse emit -----------------
 def _to_ns(ts: Optional[datetime]) -> Optional[int]:
     """Convert a datetime to OTel-style nanoseconds since epoch."""
@@ -1144,6 +1166,93 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
         trace_span.end(end_time=_to_ns(_get_latest_timestamp(turn_end_ts, last_assistant_ts, obs_end_ts, user_ts)))
 
 
+def emit_ready_turns(
+    langfuse: Langfuse,
+    session_id: str,
+    transcript_path: Path,
+    turns_to_emit: List[Turn],
+    session_state: SessionState,
+    *,
+    user_id: Optional[str],
+    subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
+) -> int:
+    emitted = 0
+    for turn in turns_to_emit:
+        emitted += 1
+        turn_num = session_state.turn_count + emitted
+        try:
+            emit_turn(
+                langfuse,
+                session_id,
+                turn_num,
+                turn,
+                transcript_path,
+                user_id=user_id,
+                subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            )
+        except Exception as e:
+            # Log at INFO so SDK incompatibilities (and other emit failures)
+            # are visible without needing CC_LANGFUSE_DEBUG=true.
+            info(f"emit_turn failed: {type(e).__name__}: {e}")
+    return emitted
+
+
+def emit_new_turns_from_transcript(
+    langfuse: Langfuse,
+    config: LangfuseConfig,
+    session_id: str,
+    transcript_path: Path,
+) -> int:
+    with FileLock(LOCK_FILE):
+        state = load_hook_state()
+        key = get_session_state_key(session_id, str(transcript_path))
+        session_state = get_session_state(state, key)
+
+        turns, session_state = get_new_turns_from_transcript(transcript_path, session_state)
+        if not turns:
+            save_session_state(state, key, session_state)
+            return 0
+
+        subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
+        if subagent_transcripts_by_tool_use_id:
+            debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
+
+        turns_to_emit = get_turns_to_emit(turns, session_state)
+        emitted = emit_ready_turns(
+            langfuse,
+            session_id,
+            transcript_path,
+            turns_to_emit,
+            session_state,
+            user_id=config.user_id,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+        )
+
+        session_state.turn_count += emitted
+        save_session_state(state, key, session_state)
+        return emitted
+
+
+def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
+    if langfuse is None:
+        return
+
+    # Cap flush+shutdown at 5s so a slow/unreachable Langfuse can't stall Claude Code.
+    try:
+        def _flush_and_shutdown():
+            try:
+                langfuse.flush()
+            except Exception:
+                pass
+            langfuse.shutdown()
+
+        t = threading.Thread(target=_flush_and_shutdown, daemon=True)
+        t.start()
+        t.join(5.0)
+    except Exception:
+        pass
+
+
 # ----------------- Main -----------------
 def main() -> int:
     start = time.time()
@@ -1165,53 +1274,7 @@ def main() -> int:
     session_id, transcript_path = hook_context
 
     try:
-        with FileLock(LOCK_FILE):
-            state = load_hook_state()
-            key = get_session_state_key(session_id, str(transcript_path))
-            ss = get_session_state(state, key)
-
-            msgs, ss = read_new_jsonl(transcript_path, ss)
-            if not msgs:
-                save_session_state(state, key, ss)
-                return 0
-
-            msgs = prepend_deferred_agent_turn_rows(msgs, ss)
-            
-            turns = build_turns(msgs)
-            if not turns:
-                save_session_state(state, key, ss)
-                return 0
-
-            subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
-            if subagent_transcripts_by_tool_use_id:
-                debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
-
-            turns_to_emit: List[Turn] = []
-            for t in turns:
-                pending_agent_tool_use_ids = get_pending_agent_tool_use_ids(t)
-                if pending_agent_tool_use_ids:
-                    for tool_use_id in pending_agent_tool_use_ids:
-                        ss.pending_agent_turns[tool_use_id] = t.rows
-                    debug(f"Deferred agent turn until task notification: {pending_agent_tool_use_ids}")
-                    continue
-                turns_to_emit.append(t)
-
-            # emit turns
-            emitted = 0
-            for t in turns_to_emit:
-                emitted += 1
-                turn_num = ss.turn_count + emitted
-                try:
-                    emit_turn(langfuse, session_id, turn_num, t, transcript_path,
-                              user_id=config.user_id, subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id)
-                except Exception as e:
-                    # Log at INFO so SDK incompatibilities (and other emit failures)
-                    # are visible without needing CC_LANGFUSE_DEBUG=true.
-                    info(f"emit_turn failed: {type(e).__name__}: {e}")
-                    # continue emitting other turns
-
-            ss.turn_count += emitted
-            save_session_state(state, key, ss)
+        emitted = emit_new_turns_from_transcript(langfuse, config, session_id, transcript_path)
 
         dur = time.time() - start
         info(f"Processed {emitted} turns in {dur:.2f}s (session={session_id})")
@@ -1226,20 +1289,7 @@ def main() -> int:
         return 0
 
     finally:
-        # Cap flush+shutdown at 5s so a slow/unreachable Langfuse can't stall Claude Code.
-        if langfuse is not None:
-            try:
-                def _flush_and_shutdown():
-                    try:
-                        langfuse.flush()
-                    except Exception:
-                        pass
-                    langfuse.shutdown()
-                t = threading.Thread(target=_flush_and_shutdown, daemon=True)
-                t.start()
-                t.join(5.0)
-            except Exception:
-                pass
+        flush_and_shutdown_langfuse_client(langfuse)
 
 if __name__ == "__main__":
     sys.exit(main())
