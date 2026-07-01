@@ -358,7 +358,7 @@ def get_tool_use_blocks(content: Any) -> List[Dict[str, Any]]:
                 out.append(x)
     return out
 
-def extract_text(content: Any) -> str:
+def extract_text_from_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -380,8 +380,8 @@ def truncate_text(s: str, max_chars: int = MAX_CHARS) -> Tuple[str, Dict[str, An
     head = s[:max_chars]
     return head, {"truncated": True, "orig_len": orig_len, "kept_len": len(head), "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest()}
 
-def get_model(msg: Dict[str, Any]) -> str:
-    m = msg.get("message")
+def get_model(row: Dict[str, Any]) -> str:
+    m = row.get("message")
     if isinstance(m, dict):
         return m.get("model") or "claude"
     return "claude"
@@ -406,8 +406,8 @@ def get_usage_details_from_row(row: Dict[str, Any]) -> Optional[Dict[str, int]]:
             details[dst] = v
     return details or None
 
-def get_message_id(msg: Dict[str, Any]) -> Optional[str]:
-    m = msg.get("message")
+def get_message_id(row: Dict[str, Any]) -> Optional[str]:
+    m = row.get("message")
     if isinstance(m, dict):
         mid = m.get("id")
         if isinstance(mid, str) and mid:
@@ -501,14 +501,14 @@ def _extract_xml_tag_value(text: str, tag: str) -> Optional[str]:
     return text[i + len(start):j]
 
 def get_tool_use_id_from_task_notification(row: Dict[str, Any]) -> Optional[str]:
-    notification_text = extract_text(get_content_from_row(row)).lstrip()
+    notification_text = extract_text_from_content(get_content_from_row(row)).lstrip()
     if not notification_text.startswith("<task-notification>"):
         return None
     tool_use_id = _extract_xml_tag_value(notification_text, "tool-use-id")
     return tool_use_id.strip() if isinstance(tool_use_id, str) and tool_use_id.strip() else None
 
 def get_result_from_task_notification_row(row: Dict[str, Any]) -> str:
-    notification_text = extract_text(get_content_from_row(row))
+    notification_text = extract_text_from_content(get_content_from_row(row))
     result = _extract_xml_tag_value(notification_text, "result")
     return result if result is not None else notification_text
 
@@ -650,7 +650,7 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             # attach it to that tool span.
             src = row.get("sourceToolUseID")
             if src:
-                txt = extract_text(get_content_from_row(row))
+                txt = extract_text_from_content(get_content_from_row(row))
                 if txt:
                     injected_by_tool_id[str(src)] = txt
                     current_rows.append(row)
@@ -803,7 +803,7 @@ def emit_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn,
                       generation_prefix: str = "Claude Generation",
                       subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[datetime]:
     """Emit a turn's generations and tool observations under an existing span."""
-    user_text, _ = truncate_text(extract_text(get_content_from_row(turn.user_msg)))
+    user_text, _ = truncate_text(extract_text_from_content(get_content_from_row(turn.user_msg)))
     prev_ts = start_ts
     prev_tool_results: List[Dict[str, Any]] = []
     pending_async_tool_results: List[Dict[str, Any]] = []
@@ -812,7 +812,7 @@ def emit_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn,
 
     for idx, am in enumerate(turn.assistant_msgs):
         am_ts = parse_timestamp(am)
-        am_text_raw = extract_text(get_content_from_row(am))
+        am_text_raw = extract_text_from_content(get_content_from_row(am))
         am_text, am_text_meta = truncate_text(am_text_raw)
         model = get_model(am)
         tool_uses = get_tool_use_blocks(get_content_from_row(am))
@@ -1035,11 +1035,11 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
 
     first_turn = turns[0]
     subagent_start_ts = parse_timestamp(first_turn.user_msg) or start_ts
-    subagent_input_text, subagent_input_meta = truncate_text(extract_text(get_content_from_row(first_turn.user_msg)))
+    subagent_input_text, subagent_input_meta = truncate_text(extract_text_from_content(get_content_from_row(first_turn.user_msg)))
 
     last_turn = turns[-1]
     last_assistant = last_turn.assistant_msgs[-1]
-    subagent_output_text, _ = truncate_text(extract_text(get_content_from_row(last_assistant)))
+    subagent_output_text, _ = truncate_text(extract_text_from_content(get_content_from_row(last_assistant)))
 
     description = subagent.get("description")
     subagent_name = f"Subagent: {description}" if isinstance(description, str) and description else "Subagent"
@@ -1081,11 +1081,11 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
               user_id: Optional[str] = None,
               subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
-    user_text_raw = extract_text(get_content_from_row(turn.user_msg))
+    user_text_raw = extract_text_from_content(get_content_from_row(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
 
     last_assistant = turn.assistant_msgs[-1]
-    final_assistant_text, _ = truncate_text(extract_text(get_content_from_row(last_assistant)))
+    final_assistant_text, _ = truncate_text(extract_text_from_content(get_content_from_row(last_assistant)))
 
     user_ts = parse_timestamp(turn.user_msg)
     last_assistant_ts = parse_timestamp(last_assistant)
