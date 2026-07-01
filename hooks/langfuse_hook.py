@@ -900,13 +900,13 @@ def emit_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn,
                 final_out_raw = tr_entry.get("final_content")
                 if final_out_raw is not None:
                     final_out_str = final_out_raw if isinstance(final_out_raw, str) else json.dumps(final_out_raw, ensure_ascii=False)
-                    final_out_trunc, final_out_meta = truncate_text(final_out_str)
+                    final_out_trunc, _ = truncate_text(final_out_str)
                     final_tr_ts = parse_timestamp(tr_entry.get("final_timestamp"))
                 else:
-                    final_out_trunc, final_out_meta, final_tr_ts = None, None, None
+                    final_out_trunc, final_tr_ts = None, None
             else:
                 out_trunc, out_meta, tr_ts = None, None, None
-                final_out_trunc, final_out_meta, final_tr_ts = None, None, None
+                final_out_trunc, final_tr_ts = None, None
 
             tool_output_trunc = out_trunc
             tool_output_meta = out_meta
