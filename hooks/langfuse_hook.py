@@ -333,52 +333,13 @@ def get_user_or_assistant_role_from_row(row: Dict[str, Any]) -> Optional[str]:
             return role
     return None
 
-def is_tool_result(row: Dict[str, Any]) -> bool:
-    role = get_user_or_assistant_role_from_row(row)
-    if role != "user":
-        return False
-    content = get_content_from_row(row)
-    if isinstance(content, list):
-        return any(isinstance(x, dict) and x.get("type") == "tool_result" for x in content)
-    return False
-
-def get_tool_result_blocks(content: Any) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    if isinstance(content, list):
-        for x in content:
-            if isinstance(x, dict) and x.get("type") == "tool_result":
-                out.append(x)
-    return out
-
-def get_tool_use_blocks(content: Any) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    if isinstance(content, list):
-        for x in content:
-            if isinstance(x, dict) and x.get("type") == "tool_use":
-                out.append(x)
-    return out
-
-def extract_text_from_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: List[str] = []
-        for x in content:
-            if isinstance(x, dict) and x.get("type") == "text":
-                parts.append(x.get("text", ""))
-            elif isinstance(x, str):
-                parts.append(x)
-        return "\n".join([p for p in parts if p])
-    return ""
-
-def truncate_text(s: str, max_chars: int = MAX_CHARS) -> Tuple[str, Dict[str, Any]]:
-    if s is None:
-        return "", {"truncated": False, "orig_len": 0}
-    orig_len = len(s)
-    if orig_len <= max_chars:
-        return s, {"truncated": False, "orig_len": orig_len}
-    head = s[:max_chars]
-    return head, {"truncated": True, "orig_len": orig_len, "kept_len": len(head), "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest()}
+def get_message_id(row: Dict[str, Any]) -> Optional[str]:
+    m = row.get("message")
+    if isinstance(m, dict):
+        mid = m.get("id")
+        if isinstance(mid, str) and mid:
+            return mid
+    return None
 
 def get_model(row: Dict[str, Any]) -> str:
     m = row.get("message")
@@ -406,14 +367,6 @@ def get_usage_details_from_row(row: Dict[str, Any]) -> Optional[Dict[str, int]]:
             details[dst] = v
     return details or None
 
-def get_message_id(row: Dict[str, Any]) -> Optional[str]:
-    m = row.get("message")
-    if isinstance(m, dict):
-        mid = m.get("id")
-        if isinstance(mid, str) and mid:
-            return mid
-    return None
-
 def parse_timestamp(value: Any) -> Optional[datetime]:
     """Parse a Claude Code jsonl row timestamp (ISO 8601 with trailing Z)."""
     if isinstance(value, dict):
@@ -424,6 +377,53 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
         return None
+
+def extract_text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for x in content:
+            if isinstance(x, dict) and x.get("type") == "text":
+                parts.append(x.get("text", ""))
+            elif isinstance(x, str):
+                parts.append(x)
+        return "\n".join([p for p in parts if p])
+    return ""
+
+def truncate_text(s: str, max_chars: int = MAX_CHARS) -> Tuple[str, Dict[str, Any]]:
+    if s is None:
+        return "", {"truncated": False, "orig_len": 0}
+    orig_len = len(s)
+    if orig_len <= max_chars:
+        return s, {"truncated": False, "orig_len": orig_len}
+    head = s[:max_chars]
+    return head, {"truncated": True, "orig_len": orig_len, "kept_len": len(head), "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest()}
+
+def get_tool_use_blocks(content: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if isinstance(content, list):
+        for x in content:
+            if isinstance(x, dict) and x.get("type") == "tool_use":
+                out.append(x)
+    return out
+
+def get_tool_result_blocks(content: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if isinstance(content, list):
+        for x in content:
+            if isinstance(x, dict) and x.get("type") == "tool_result":
+                out.append(x)
+    return out
+
+def is_tool_result(row: Dict[str, Any]) -> bool:
+    role = get_user_or_assistant_role_from_row(row)
+    if role != "user":
+        return False
+    content = get_content_from_row(row)
+    if isinstance(content, list):
+        return any(isinstance(x, dict) and x.get("type") == "tool_result" for x in content)
+    return False
 
 
 # ----------------- Incremental transcript reading -----------------
