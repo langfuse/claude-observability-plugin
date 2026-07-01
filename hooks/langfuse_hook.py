@@ -23,19 +23,20 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# --- Langfuse import (fail-open) ---
+# ----------------- Langfuse import (fail-open) -----------------
 try:
     from langfuse import Langfuse, propagate_attributes
     from opentelemetry import trace as otel_trace_api
 except Exception:
     sys.exit(0)
 
-# --- Paths ---
+# ----------------- Paths -----------------
 STATE_DIR = Path.home() / ".claude" / "state"
 LOG_FILE = STATE_DIR / "langfuse_hook.log"
 STATE_FILE = STATE_DIR / "langfuse_state.json"
 LOCK_FILE = STATE_DIR / "langfuse_state.lock"
 
+# ----------------- Configuration -----------------
 def _opt(name: str) -> str:
     """Read a plugin userConfig value (CLAUDE_PLUGIN_OPTION_<NAME>) with a fallback to a plain env var."""
     return os.environ.get(f"CLAUDE_PLUGIN_OPTION_{name}") or os.environ.get(name) or ""
@@ -47,6 +48,43 @@ try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
     MAX_CHARS = 20000
+
+
+@dataclass
+class LangfuseConfig:
+    public_key: str
+    secret_key: str
+    host: str
+    user_id: Optional[str]
+
+
+def get_langfuse_config() -> Optional[LangfuseConfig]:
+    public_key = _opt("LANGFUSE_PUBLIC_KEY") or _opt("CC_LANGFUSE_PUBLIC_KEY")
+    secret_key = _opt("LANGFUSE_SECRET_KEY") or _opt("CC_LANGFUSE_SECRET_KEY")
+    host = _opt("LANGFUSE_BASE_URL") or _opt("CC_LANGFUSE_BASE_URL") or "https://us.cloud.langfuse.com"
+    user_id = _opt("LANGFUSE_USER_ID") or _opt("CC_LANGFUSE_USER_ID") or None
+
+    if not public_key or not secret_key:
+        return None
+
+    return LangfuseConfig(
+        public_key=public_key,
+        secret_key=secret_key,
+        host=host,
+        user_id=user_id,
+    )
+
+
+def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
+    try:
+        return Langfuse(
+            public_key=config.public_key,
+            secret_key=config.secret_key,
+            host=config.host,
+        )
+    except Exception:
+        return None
+
 
 # ----------------- Logging -----------------
 _logger: Optional[logging.Logger] = None
@@ -1092,12 +1130,12 @@ def main() -> int:
     start = time.time()
     debug("Hook started")
 
-    public_key = _opt("LANGFUSE_PUBLIC_KEY") or _opt("CC_LANGFUSE_PUBLIC_KEY")
-    secret_key = _opt("LANGFUSE_SECRET_KEY") or _opt("CC_LANGFUSE_SECRET_KEY")
-    host = _opt("LANGFUSE_BASE_URL") or _opt("CC_LANGFUSE_BASE_URL") or "https://us.cloud.langfuse.com"
-    user_id = _opt("LANGFUSE_USER_ID") or _opt("CC_LANGFUSE_USER_ID") or None
+    config = get_langfuse_config()
+    if config is None:
+        return 0
 
-    if not public_key or not secret_key:
+    langfuse = create_langfuse_client(config)
+    if langfuse is None:
         return 0
 
     payload = read_hook_payload()
@@ -1110,12 +1148,6 @@ def main() -> int:
 
     if not transcript_path.exists():
         debug(f"Transcript path does not exist: {transcript_path}")
-        return 0
-
-    langfuse = None
-    try:
-        langfuse = Langfuse(public_key=public_key, secret_key=secret_key, host=host)
-    except Exception:
         return 0
 
     try:
@@ -1158,7 +1190,7 @@ def main() -> int:
                 turn_num = ss.turn_count + emitted
                 try:
                     emit_turn(langfuse, session_id, turn_num, t, transcript_path,
-                              user_id=user_id, subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id)
+                              user_id=config.user_id, subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id)
                 except Exception as e:
                     # Log at INFO so SDK incompatibilities (and other emit failures)
                     # are visible without needing CC_LANGFUSE_DEBUG=true.
