@@ -227,7 +227,7 @@ class FileLock:
                 pass
             raise
 
-def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb):
         try:
             import fcntl
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
@@ -240,7 +240,7 @@ def __exit__(self, exc_type, exc, tb):
 
 
 # ----------------- State management -----------------
-def load_state() -> Dict[str, Any]:
+def load_hook_state() -> Dict[str, Any]:
     try:
         if not STATE_FILE.exists():
             return {}
@@ -248,7 +248,7 @@ def load_state() -> Dict[str, Any]:
     except Exception:
         return {}
 
-def save_state(state: Dict[str, Any]) -> None:
+def save_hook_state(state: Dict[str, Any]) -> None:
     try:
         # Drop session entries older than 30 days to keep the file bounded.
         cutoff = datetime.now(timezone.utc) - timedelta(days=30)
@@ -270,9 +270,9 @@ def save_state(state: Dict[str, Any]) -> None:
         tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(tmp, STATE_FILE)
     except Exception as e:
-        debug(f"save_state failed: {e}")
+        debug(f"save_hook_state failed: {e}")
 
-def state_key(session_id: str, transcript_path: str) -> str:
+def get_session_state_key(session_id: str, transcript_path: str) -> str:
     # stable key even if session_id collides
     raw = f"{session_id}::{transcript_path}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -402,7 +402,7 @@ class SessionState:
     turn_count: int = 0   # Turns already emitted for this session.
     pending_agent_turns: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
 
-def load_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
+def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
     pending = s.get("pending_agent_turns")
     if not isinstance(pending, dict):
@@ -414,7 +414,7 @@ def load_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
         pending_agent_turns=pending,
     )
 
-def write_session_state(global_state: Dict[str, Any], key: str, ss: SessionState) -> None:
+def update_session_state(global_state: Dict[str, Any], key: str, ss: SessionState) -> None:
     global_state[key] = {
         "offset": ss.offset,
         "buffer": ss.buffer,
@@ -422,6 +422,10 @@ def write_session_state(global_state: Dict[str, Any], key: str, ss: SessionState
         "pending_agent_turns": ss.pending_agent_turns or {},
         "updated": datetime.now(timezone.utc).isoformat(),
     }
+
+def save_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
+    update_session_state(global_state, key, session_state)
+    save_hook_state(global_state)
 
 def read_new_jsonl(transcript_path: Path, ss: SessionState) -> Tuple[List[Dict[str, Any]], SessionState]:
     """
@@ -1162,21 +1166,20 @@ def main() -> int:
 
     try:
         with FileLock(LOCK_FILE):
-            state = load_state()
-            key = state_key(session_id, str(transcript_path))
-            ss = load_session_state(state, key)
+            state = load_hook_state()
+            key = get_session_state_key(session_id, str(transcript_path))
+            ss = get_session_state(state, key)
 
             msgs, ss = read_new_jsonl(transcript_path, ss)
             if not msgs:
-                write_session_state(state, key, ss)
-                save_state(state)
+                save_session_state(state, key, ss)
                 return 0
 
             msgs = prepend_deferred_agent_turn_rows(msgs, ss)
+            
             turns = build_turns(msgs)
             if not turns:
-                write_session_state(state, key, ss)
-                save_state(state)
+                save_session_state(state, key, ss)
                 return 0
 
             subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
@@ -1208,8 +1211,7 @@ def main() -> int:
                     # continue emitting other turns
 
             ss.turn_count += emitted
-            write_session_state(state, key, ss)
-            save_state(state)
+            save_session_state(state, key, ss)
 
         dur = time.time() - start
         info(f"Processed {emitted} turns in {dur:.2f}s (session={session_id})")
