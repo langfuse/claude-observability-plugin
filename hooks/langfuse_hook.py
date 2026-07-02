@@ -513,10 +513,16 @@ def _extract_xml_tag_value(text: str, tag: str) -> Optional[str]:
         return None
     return text[i + len(start):j]
 
-def get_tool_use_id_from_task_notification(row: Dict[str, Any]) -> Optional[str]:
+def is_task_notification_row(row: Dict[str, Any]) -> bool:
+    origin = row.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") == "task-notification":
+        return True
+
     notification_text = extract_text_from_content(get_content_from_row(row)).lstrip()
-    if not notification_text.startswith("<task-notification>"):
-        return None
+    return notification_text.startswith("<task-notification>")
+
+def get_tool_use_id_from_task_notification(row: Dict[str, Any]) -> Optional[str]:
+    notification_text = extract_text_from_content(get_content_from_row(row))
     tool_use_id = _extract_xml_tag_value(notification_text, "tool-use-id")
     return tool_use_id.strip() if isinstance(tool_use_id, str) and tool_use_id.strip() else None
 
@@ -601,13 +607,15 @@ def add_tool_result_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
     return True
 
 def add_task_notification_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
-    tool_use_id = get_tool_use_id_from_task_notification(row)
-    if not tool_use_id:
+    if not is_task_notification_row(row):
         return False
 
     if state.current_turn_user_row is None:
-        state.current_turn_user_row = row
-        state.current_rows = [row]
+        return True
+
+    tool_use_id = get_tool_use_id_from_task_notification(row)
+    if not tool_use_id:
+        state.current_rows.append(row)
         return True
 
     existing_result = state.tool_results_by_id.get(tool_use_id)
