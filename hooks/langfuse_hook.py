@@ -190,6 +190,10 @@ def get_session_id_and_transcript_path(payload: Dict[str, Any]) -> Optional[Tupl
 
     return session_id, transcript_path
 
+def is_session_end_hook_payload(payload: Dict[str, Any]) -> bool:
+    hook_event_name = payload.get("hook_event_name") or payload.get("hookEventName")
+    return hook_event_name == "SessionEnd"
+
 
 # ----------------- State file concurrency control -----------------
 class FileLock:
@@ -549,6 +553,58 @@ def get_result_from_task_notification(row: Dict[str, Any]) -> str:
     result = _extract_xml_tag_value(notification_text, "result")
     return result if result is not None else notification_text
 
+def get_deferred_agent_turn_rows_key(rows: List[Dict[str, Any]]) -> str:
+    stable_row_ids: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_id = row.get("uuid") or row.get("requestId") or row.get("timestamp")
+        if row_id is not None:
+            stable_row_ids.append(str(row_id))
+    if stable_row_ids:
+        return "|".join(stable_row_ids)
+
+    try:
+        serialized_rows = json.dumps(rows, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        serialized_rows = repr(rows)
+    return hashlib.sha256(serialized_rows.encode("utf-8")).hexdigest()
+
+def pop_deferred_agent_turn_rows(
+    session_state: SessionState,
+    tool_use_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    selected_tool_use_ids = (
+        tool_use_ids
+        if tool_use_ids is not None
+        else list(session_state.pending_agent_turns.keys())
+    )
+    rows_to_prepend: List[Dict[str, Any]] = []
+    popped_row_keys = set()
+
+    for tool_use_id in selected_tool_use_ids:
+        deferred_rows = session_state.pending_agent_turns.pop(tool_use_id, None)
+        if not isinstance(deferred_rows, list):
+            continue
+
+        row_key = get_deferred_agent_turn_rows_key(deferred_rows)
+        if row_key in popped_row_keys:
+            continue
+
+        popped_row_keys.add(row_key)
+        rows_to_prepend.extend(deferred_rows)
+
+    if popped_row_keys:
+        # One deferred turn can wait on multiple async Agent/Task tool calls.
+        # Drop sibling entries that point at the same stored turn rows.
+        for tool_use_id, deferred_rows in list(session_state.pending_agent_turns.items()):
+            if not isinstance(deferred_rows, list):
+                continue
+            if get_deferred_agent_turn_rows_key(deferred_rows) in popped_row_keys:
+                session_state.pending_agent_turns.pop(tool_use_id, None)
+
+    return rows_to_prepend
+
 def prepend_deferred_agent_turn_rows(
     rows: List[Dict[str, Any]],
     session_state: SessionState,
@@ -560,11 +616,33 @@ def prepend_deferred_agent_turn_rows(
     for row in rows:
         tool_use_id = get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
         if tool_use_id and tool_use_id in session_state.pending_agent_turns:
-            rows_with_deferred_turns.extend(session_state.pending_agent_turns.pop(tool_use_id))
+            rows_with_deferred_turns.extend(pop_deferred_agent_turn_rows(session_state, [tool_use_id]))
         rows_with_deferred_turns.append(row)
     return rows_with_deferred_turns
 
-def get_pending_agent_tool_use_ids(turn: Turn) -> List[str]:
+def get_tool_result_text(tool_result_entry: Any) -> str:
+    if not isinstance(tool_result_entry, dict):
+        return ""
+    tool_result_content = tool_result_entry.get("content")
+    if isinstance(tool_result_content, str):
+        return tool_result_content
+    return json.dumps(tool_result_content, ensure_ascii=False)
+
+def is_async_agent_launch_result(tool_result_entry: Any) -> bool:
+    tool_result_text = get_tool_result_text(tool_result_entry)
+    return (
+        "Async agent launched successfully" in tool_result_text
+        or (
+            "agentId:" in tool_result_text
+            and "output_file:" in tool_result_text
+            and "You will be notified automatically" in tool_result_text
+        )
+    )
+
+def get_pending_agent_tool_use_ids(
+    turn: Turn,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[str]:
     tool_use_ids: List[str] = []
     for assistant_message in turn.assistant_msgs:
         for tool_use_block in get_tool_use_blocks(get_content_from_row(assistant_message)):
@@ -576,17 +654,29 @@ def get_pending_agent_tool_use_ids(turn: Turn) -> List[str]:
             tool_result_entry = turn.tool_results_by_id.get(tool_use_id)
             if isinstance(tool_result_entry, dict) and tool_result_entry.get("final_content") is not None:
                 continue
-            tool_result_content = tool_result_entry.get("content") if isinstance(tool_result_entry, dict) else None
-            tool_result_text = tool_result_content if isinstance(tool_result_content, str) else json.dumps(tool_result_content, ensure_ascii=False)
-            if "Async agent launched successfully" in tool_result_text:
+            has_subagent_transcript = (
+                subagent_transcripts_by_tool_use_id is not None
+                and tool_use_id in subagent_transcripts_by_tool_use_id
+            )
+            if has_subagent_transcript or is_async_agent_launch_result(tool_result_entry):
                 tool_use_ids.append(tool_use_id)
     return tool_use_ids
 
-def get_turns_to_emit(turns: List[Turn], session_state: SessionState) -> List[Turn]:
+def get_turns_to_emit(
+    turns: List[Turn],
+    session_state: SessionState,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    flush_deferred_agent_turns: bool = False,
+) -> List[Turn]:
     turns_to_emit: List[Turn] = []
     for turn in turns:
-        pending_agent_tool_use_ids = get_pending_agent_tool_use_ids(turn)
+        pending_agent_tool_use_ids = get_pending_agent_tool_use_ids(turn, subagent_transcripts_by_tool_use_id)
         if pending_agent_tool_use_ids:
+            if flush_deferred_agent_turns:
+                debug(f"Emitting async agent turn without task notification: {pending_agent_tool_use_ids}")
+                turns_to_emit.append(turn)
+                continue
             for tool_use_id in pending_agent_tool_use_ids:
                 session_state.pending_agent_turns[tool_use_id] = turn.rows
             debug(f"Deferred agent turn until task notification: {pending_agent_tool_use_ids}")
@@ -786,13 +876,24 @@ def get_new_turns_from_transcript(
     transcript_path: Path,
     session_state: SessionState,
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    flush_deferred_agent_turns: bool = False,
 ) -> Tuple[List[Turn], SessionState]:
     rows, session_state = read_new_jsonl(transcript_path, session_state)
+    task_id_to_tool_use_id = get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id)
+
+    if rows:
+        rows = prepend_deferred_agent_turn_rows(rows, session_state, task_id_to_tool_use_id)
+
+    if flush_deferred_agent_turns and session_state.pending_agent_turns:
+        deferred_rows = pop_deferred_agent_turn_rows(session_state)
+        if deferred_rows:
+            debug(f"Flushing {len(deferred_rows)} deferred agent row(s) without task notification")
+            rows = deferred_rows + rows
+
     if not rows:
         return [], session_state
 
-    task_id_to_tool_use_id = get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id)
-    rows = prepend_deferred_agent_turn_rows(rows, session_state, task_id_to_tool_use_id)
     return build_turns(rows, task_id_to_tool_use_id), session_state
 
 def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
@@ -1569,6 +1670,8 @@ def emit_new_turns_from_transcript(
     config: LangfuseConfig,
     session_id: str,
     transcript_path: Path,
+    *,
+    flush_deferred_agent_turns: bool = False,
 ) -> int:
     with FileLock(LOCK_FILE):
         state = load_hook_state()
@@ -1583,12 +1686,18 @@ def emit_new_turns_from_transcript(
             transcript_path,
             session_state,
             subagent_transcripts_by_tool_use_id,
+            flush_deferred_agent_turns=flush_deferred_agent_turns,
         )
         if not turns:
             save_session_state(state, key, session_state)
             return 0
 
-        turns_to_emit = get_turns_to_emit(turns, session_state)
+        turns_to_emit = get_turns_to_emit(
+            turns,
+            session_state,
+            subagent_transcripts_by_tool_use_id,
+            flush_deferred_agent_turns=flush_deferred_agent_turns,
+        )
         emitted = emit_ready_turns(
             langfuse,
             session_id,
@@ -1643,9 +1752,16 @@ def main() -> int:
         return 0
 
     session_id, transcript_path = hook_context
+    flush_deferred_agent_turns = is_session_end_hook_payload(payload)
 
     try:
-        emitted = emit_new_turns_from_transcript(langfuse, config, session_id, transcript_path)
+        emitted = emit_new_turns_from_transcript(
+            langfuse,
+            config,
+            session_id,
+            transcript_path,
+            flush_deferred_agent_turns=flush_deferred_agent_turns,
+        )
 
         dur = time.time() - start
         info(f"Processed {emitted} turns in {dur:.2f}s (session={session_id})")
