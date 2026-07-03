@@ -93,6 +93,25 @@ In Claude Code, run:
 /plugin configure langfuse-observability@langfuse-observability
 ```
 
+## Disable tracing
+
+To stop tracing for new Claude Code CLI sessions and new Claude Code GUI Code mode sessions, disable the plugin:
+
+```bash
+claude plugin disable langfuse-observability@langfuse-observability --scope user
+claude plugin list
+```
+
+`claude plugin list` should show the plugin as disabled. This keeps the plugin installed and does not delete your configuration.
+
+To enable tracing again:
+
+```bash
+claude plugin enable langfuse-observability@langfuse-observability --scope user
+```
+
+If a Claude Code session is already running, restart it after disabling the plugin. Running sessions may have loaded their hooks at startup, so disabling the plugin is intended for new sessions.
+
 ## Uninstall
 
 ```bash
