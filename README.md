@@ -1,6 +1,6 @@
 # Langfuse Observability Plugin for Claude Code
 
-Trace every Claude Code session to [Langfuse](https://langfuse.com) — turns, generations, tool calls, and token usage — with zero code changes.
+Trace hook-backed Claude Code sessions to [Langfuse](https://langfuse.com) — turns, generations, tool calls, and token usage — with zero code changes.
 
 ## Install
 
@@ -9,9 +9,11 @@ claude plugin marketplace add langfuse/Claude-Observability-Plugin
 claude plugin install langfuse-observability@langfuse-observability
 ```
 
-Restart Claude Code after install.
+The marketplace command registers the plugin marketplace and refreshes its local cache. The install command enables the plugin for your Claude Code user scope.
 
-Then configure the plugin from within Claude Code:
+Restart Claude Code after install so the hook configuration is loaded.
+
+Then configure the plugin from within a Claude Code session. This is a Claude Code slash command, not a shell command:
 
 ```text
 /plugin configure langfuse-observability@langfuse-observability
@@ -54,6 +56,19 @@ If neither is set up, the hook exits silently — no impact on Claude Code.
 
 A hook reads the session transcript incrementally on every turn (Stop) and at session end (SessionEnd), and emits a Langfuse trace with one span per turn, nested generations per assistant message, and child tool spans for every tool call. Token usage is captured when present.
 
+The plugin observes only data that Claude Code exposes through hooks and transcript files.
+
+Captured:
+
+- Claude Code CLI sessions
+- Claude Code GUI Code mode sessions
+
+Not captured:
+
+- Regular Claude Desktop Chat mode conversations
+
+If you use the desktop app, switch to Code mode for hook-backed tracing. Regular Chat mode does not invoke Claude Code Stop or SessionEnd hooks and does not write the transcript file this plugin reads.
+
 State is kept in `~/.claude/state/langfuse_state.json` so re-runs only emit new turns.
 
 ## Privacy
@@ -87,6 +102,7 @@ claude plugin uninstall langfuse-observability
 ## Troubleshooting
 
 - Nothing in Langfuse: check `~/.claude/state/langfuse_hook.log` (enable `CC_LANGFUSE_DEBUG`).
+- Desktop chat has no traces: regular Claude Desktop Chat mode is not hook-backed. Use the `claude` CLI or Claude Code GUI Code mode.
 - Hook not firing: confirm with `claude plugin list` that langfuse-observability is enabled; restart Claude Code.
 - langfuse import errors (no uv): ensure the `python3` on your PATH has the SDK installed, or install uv.
 
