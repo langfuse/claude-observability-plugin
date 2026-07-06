@@ -39,7 +39,16 @@ If neither is set up, the hook exits silently — no impact on Claude Code.
 
 A hook reads the session transcript incrementally on every turn (Stop) and at session end (SessionEnd), and emits a Langfuse trace with one span per turn, nested generations per assistant message, and child tool spans for every tool call. Token usage is captured when present.
 
-State is kept in `~/.claude/state/langfuse_state.json` so re-runs only emit new turns.
+**Subagents (Task tool)** run in isolated sub-sessions with their own transcripts under
+`<session>/subagents/agent-*.jsonl`, so their model calls, tool use and cost are absent from the
+parent transcript. The hook sweeps that directory and emits each subagent as a separate trace in
+the **same Langfuse session**, tagged `subagent` / `agent:<type>` / `parent_tool:<id>` and linked
+back to the spawning `Task` tool_use via metadata (`parent_tool_use_id`). Nested subagents
+(`spawnDepth > 1`) are handled recursively. Without this, only the orchestrator model appears and
+session cost is undercounted.
+
+State is kept in `~/.claude/state/langfuse_state.json` so re-runs only emit new turns (per-file
+offsets, including one per subagent transcript).
 
 ## Privacy
 

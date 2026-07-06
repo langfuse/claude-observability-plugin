@@ -617,7 +617,10 @@ def trace_display_name(session_id: str, turn_num: int) -> str:
 
 
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
-              user_id: Optional[str] = None) -> None:
+              user_id: Optional[str] = None, *,
+              trace_name: Optional[str] = None, root_name: Optional[str] = None,
+              extra_tags: Optional[List[str]] = None,
+              extra_metadata: Optional[Dict[str, Any]] = None) -> None:
     user_text_raw = extract_text(get_content_from_row(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
 
@@ -649,12 +652,20 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
         if isinstance(v, str) and v:
             trace_metadata[dst_key] = v
 
+    # Subagent turns pass linkage metadata (agent type, parent tool_use id, …).
+    if extra_metadata:
+        for mk, mv in extra_metadata.items():
+            if mv is not None:
+                trace_metadata[mk] = mv
+
     tags = ["claude-code"]
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
+    if extra_tags:
+        tags += extra_tags
 
-    trace_name = trace_display_name(session_id, turn_num)
-    root_observation_name = f"Turn {turn_num}"
+    trace_name = trace_name or trace_display_name(session_id, turn_num)
+    root_observation_name = root_name or f"Turn {turn_num}"
 
     with propagate_attributes(
         session_id=session_id,
@@ -812,6 +823,93 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
         trace_span.update(output={"role": "assistant", "content": final_assistant_text})
         trace_span.end(end_time=_to_ns(turn_end_ts or last_assistant_ts or user_ts))
 
+# ----------------- Subagents -----------------
+def subagents_dir_for(transcript_path: Path) -> Path:
+    """Claude Code stores each Task subagent's conversation in a sibling dir:
+    <project>/<session>.jsonl  ->  <project>/<session>/subagents/agent-<id>.jsonl
+    """
+    return transcript_path.with_suffix("") / "subagents"
+
+
+def read_agent_meta(meta_path: Path) -> Dict[str, Any]:
+    """Read agent-<id>.meta.json ({agentType, description, toolUseId, spawnDepth})."""
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def process_subagents(langfuse: Langfuse, session_id: str, transcript_path: Path,
+                      state: Dict[str, Any], user_id: Optional[str]) -> int:
+    """Discover and emit subagent (Task tool) transcripts that the main hook misses.
+
+    Each subagent runs in an isolated sub-session with its own transcript under
+    <session>/subagents/agent-*.jsonl, so its model calls, tool use and cost are
+    absent from the parent transcript. We feed each subagent transcript through
+    the SAME incremental pipeline (read_new_jsonl -> build_turns -> emit_turn) and
+    emit it as a separate trace in the SAME Langfuse session, linked back to the
+    spawning Task tool_use via metadata + tags. Idempotent via per-file offset
+    state. Recurses for nested subagents (spawnDepth > 1).
+    """
+    subdir = subagents_dir_for(transcript_path)
+    if not subdir.is_dir():
+        return 0
+
+    total = 0
+    for agent_jsonl in sorted(subdir.glob("agent-*.jsonl")):
+        # Isolate each subagent file: a malformed one must not abort the sweep
+        # (or prevent the caller from persisting main-transcript state).
+        try:
+            meta = read_agent_meta(agent_jsonl.with_suffix(".meta.json"))
+            agent_type = meta.get("agentType") or "subagent"
+            parent_tool = meta.get("toolUseId")
+            spawn_depth = meta.get("spawnDepth")
+
+            key = state_key(session_id, str(agent_jsonl))
+            ss = load_session_state(state, key)
+            msgs, ss = read_new_jsonl(agent_jsonl, ss)
+
+            emitted = 0
+            if msgs:
+                turns = build_turns(msgs)
+                sid_label = short_session_label(session_id)
+                # Keep tags low-cardinality; the parent tool_use id (unique per
+                # call) is carried in metadata, not as a tag.
+                extra_tags = ["subagent", f"agent:{agent_type}"]
+                extra_metadata = {
+                    "subagent": True,
+                    "agent_type": agent_type,
+                    "agent_description": meta.get("description"),
+                    "parent_tool_use_id": parent_tool,
+                    "spawn_depth": spawn_depth,
+                    "subagent_transcript": str(agent_jsonl),
+                }
+                for t in turns:
+                    emitted += 1
+                    turn_num = ss.turn_count + emitted
+                    trace_name = f"Subagent [{agent_type}] - Turn {turn_num} ({sid_label})"
+                    try:
+                        emit_turn(
+                            langfuse, session_id, turn_num, t, agent_jsonl, user_id=user_id,
+                            trace_name=trace_name, root_name=f"Subagent Turn {turn_num}",
+                            extra_tags=extra_tags, extra_metadata=extra_metadata,
+                        )
+                    except Exception as e:
+                        info(f"emit subagent turn failed: {type(e).__name__}: {e}")
+                ss.turn_count += emitted
+
+            write_session_state(state, key, ss)
+            total += emitted
+
+            # Nested subagents (a subagent that itself spawned subagents).
+            total += process_subagents(langfuse, session_id, agent_jsonl, state, user_id)
+        except Exception as e:
+            info(f"process_subagents({agent_jsonl.name}) failed: {type(e).__name__}: {e}")
+            continue
+
+    return total
+
 # ----------------- Main -----------------
 def main() -> int:
     start = time.time()
@@ -849,21 +947,12 @@ def main() -> int:
             key = state_key(session_id, str(transcript_path))
             ss = load_session_state(state, key)
 
+            # Emit any new main-transcript turns. We no longer early-return when
+            # there are none, so subagent transcripts are still swept (e.g. on
+            # SessionEnd) even after the parent turn was already processed.
             msgs, ss = read_new_jsonl(transcript_path, ss)
-            if not msgs:
-                write_session_state(state, key, ss)
-                save_state(state)
-                return 0
-
-            turns = build_turns(msgs)
-            if not turns:
-                write_session_state(state, key, ss)
-                save_state(state)
-                return 0
-
-            # emit turns
             emitted = 0
-            for t in turns:
+            for t in build_turns(msgs) if msgs else []:
                 emitted += 1
                 turn_num = ss.turn_count + emitted
                 try:
@@ -876,10 +965,18 @@ def main() -> int:
 
             ss.turn_count += emitted
             write_session_state(state, key, ss)
+
+            # Subagents (Task tool) run in isolated transcripts the parent hook
+            # never sees; sweep and emit them into the same session.
+            subagent_emitted = process_subagents(langfuse, session_id, transcript_path, state, user_id)
+
             save_state(state)
 
         dur = time.time() - start
-        info(f"Processed {emitted} turns in {dur:.2f}s (session={session_id})")
+        info(
+            f"Processed {emitted} turns + {subagent_emitted} subagent turns "
+            f"in {dur:.2f}s (session={session_id})"
+        )
         return 0
 
     except TimeoutError as e:
