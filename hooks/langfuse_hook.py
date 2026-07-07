@@ -1068,13 +1068,12 @@ def build_generation_input(
 ) -> Any:
     if assistant_index == 0:
         return {"role": "user", "content": user_text}
-    if previous_tool_results:
-        return {"role": "tool", "tool_results": previous_tool_results}
-    if ready_async_tool_results:
-        return {
-            "role": "tool",
-            "tool_results": [result["tool_result"] for result in ready_async_tool_results],
-        }
+    # Both feed the next generation's context: results from the previous tool
+    # batch AND async agent results that became ready since.
+    tool_results = list(previous_tool_results)
+    tool_results += [result["tool_result"] for result in ready_async_tool_results]
+    if tool_results:
+        return {"role": "tool", "tool_results": tool_results}
     return None
 
 def build_generation_output(assistant_text: str, tool_uses: List[Dict[str, Any]]) -> Dict[str, Any]:
