@@ -24,8 +24,14 @@ def make_assistant_row(uuid: str, message_id: str, content: list[dict[str, Any]]
     }
 
 
-def make_async_launch_result_row(uuid: str, tool_use_id: str, timestamp: str) -> dict[str, Any]:
-    return {
+def make_agent_result_row(
+    uuid: str,
+    tool_use_id: str,
+    text: str,
+    timestamp: str,
+    tool_use_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
         "type": "user",
         "timestamp": timestamp,
         "uuid": uuid,
@@ -35,21 +41,29 @@ def make_async_launch_result_row(uuid: str, tool_use_id: str, timestamp: str) ->
                 {
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Async agent launched successfully.\n"
-                                "agentId: agent-test\n"
-                                "output_file: /tmp/agent-test.txt\n"
-                                "You will be notified automatically when the agent completes."
-                            ),
-                        }
-                    ],
+                    "content": [{"type": "text", "text": text}],
                 }
             ],
         },
     }
+    if tool_use_result is not None:
+        row["toolUseResult"] = tool_use_result
+    return row
+
+
+def make_async_launch_result_row(uuid: str, tool_use_id: str, timestamp: str) -> dict[str, Any]:
+    return make_agent_result_row(
+        uuid,
+        tool_use_id,
+        (
+            "Async agent launched successfully.\n"
+            "agentId: agent-test\n"
+            "output_file: /tmp/agent-test.txt\n"
+            "You will be notified automatically when the agent completes."
+        ),
+        timestamp,
+        tool_use_result={"status": "async_launched", "isAsync": True, "agentId": "agent-test"},
+    )
 
 
 def make_notification_row(uuid: str, tool_use_id: str, result: str, timestamp: str) -> dict[str, Any]:
@@ -103,7 +117,7 @@ def test_completed_async_agent_turn_is_ready_to_emit(
     subagents = hook_module.get_subagent_transcripts_by_tool_use_id(transcript)
 
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state, subagents)
-    turns_to_emit = hook_module.get_turns_to_emit(turns, state, subagents)
+    turns_to_emit = hook_module.get_turns_to_emit(turns, state)
 
     assert len(turns) == 1
     assert len(turns_to_emit) == 1
@@ -121,7 +135,7 @@ def test_uncompleted_async_agent_turn_is_deferred_until_flush(
     subagents = hook_module.get_subagent_transcripts_by_tool_use_id(transcript)
 
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state, subagents)
-    turns_to_emit = hook_module.get_turns_to_emit(turns, state, subagents)
+    turns_to_emit = hook_module.get_turns_to_emit(turns, state)
 
     assert turns_to_emit == []
     assert len(state.pending_agent_turns) == 1
@@ -136,7 +150,6 @@ def test_uncompleted_async_agent_turn_is_deferred_until_flush(
     flushed_to_emit = hook_module.get_turns_to_emit(
         flushed_turns,
         state,
-        subagents,
         flush_deferred_agent_turns=True,
     )
 
@@ -356,3 +369,102 @@ def test_notification_before_first_assistant_row_does_not_drop_the_turn(hook_mod
     assert resolved_turn.tool_results_by_id["toolu_bg"]["final_content"] == "Background result."
     assert current_turn.user_msg["uuid"] == "user-2"
     assert [m["message"]["id"] for m in current_turn.assistant_msgs] == ["msg-3"]
+
+
+def sync_agent_turn_rows(tool_use_id: str = "toolu_sync", result_text: str = "Here is the final research report.") -> list[dict[str, Any]]:
+    return [
+        make_user_row("user-1", "Run a subagent for research.", "2026-01-01T00:00:00.000Z"),
+        make_assistant_row(
+            "assistant-1",
+            "msg-1",
+            [{"type": "tool_use", "id": tool_use_id, "name": "Agent",
+              "input": {"description": "Research", "prompt": "Research now"}}],
+            "2026-01-01T00:00:01.000Z",
+        ),
+        make_agent_result_row(
+            "tool-result-1",
+            tool_use_id,
+            result_text,
+            "2026-01-01T00:00:02.000Z",
+            tool_use_result={"status": "completed", "agentId": "agent-sync", "totalDurationMs": 1000},
+        ),
+        make_assistant_row(
+            "assistant-2",
+            "msg-2",
+            [{"type": "text", "text": "Summary of the research."}],
+            "2026-01-01T00:00:03.000Z",
+        ),
+    ]
+
+
+def test_sync_agent_turn_is_emitted_immediately_despite_subagent_transcript(hook_module):
+    """Regression: a subagent transcript on disk used to defer the turn, but
+    sync agents never produce the task notification that releases it, so the
+    turn was stuck until SessionEnd (or lost entirely in killed sessions)."""
+    turns = hook_module.build_turns(sync_agent_turn_rows())
+    state = hook_module.SessionState()
+
+    turns_to_emit = hook_module.get_turns_to_emit(turns, state)
+
+    assert len(turns_to_emit) == 1
+    assert state.pending_agent_turns == []
+
+
+def test_structured_async_marker_defers_even_if_launch_text_changes(hook_module):
+    rows = [
+        make_user_row("user-1", "Start a background agent.", "2026-01-01T00:00:00.000Z"),
+        make_assistant_row(
+            "assistant-1",
+            "msg-1",
+            [{"type": "tool_use", "id": "toolu_bg", "name": "Agent", "input": {}}],
+            "2026-01-01T00:00:01.000Z",
+        ),
+        make_agent_result_row(
+            "tool-result-1",
+            "toolu_bg",
+            "Background agent started.",  # no recognizable launch prose
+            "2026-01-01T00:00:02.000Z",
+            tool_use_result={"status": "async_launched", "isAsync": True},
+        ),
+        make_assistant_row(
+            "assistant-2",
+            "msg-2",
+            [{"type": "text", "text": "Working in the background."}],
+            "2026-01-01T00:00:03.000Z",
+        ),
+    ]
+    turns = hook_module.build_turns(rows)
+    state = hook_module.SessionState()
+
+    turns_to_emit = hook_module.get_turns_to_emit(turns, state)
+
+    assert turns_to_emit == []
+    assert len(state.pending_agent_turns) == 1
+    assert state.pending_agent_turns[0]["pending_tool_use_ids"] == ["toolu_bg"]
+
+
+def test_structured_completed_marker_suppresses_launch_text_false_positive(hook_module):
+    # A sync agent whose RESULT quotes the launch prose (e.g. it inspected
+    # another transcript) must not be mistaken for an async launch.
+    quoted = 'The transcript said: "Async agent launched successfully. You will be notified automatically."'
+    turns = hook_module.build_turns(sync_agent_turn_rows(result_text=quoted))
+    state = hook_module.SessionState()
+
+    turns_to_emit = hook_module.get_turns_to_emit(turns, state)
+
+    assert len(turns_to_emit) == 1
+    assert state.pending_agent_turns == []
+
+
+def test_launch_text_fallback_defers_rows_without_tool_use_result(hook_module):
+    # Older Claude Code versions have no toolUseResult on the row; the prose
+    # heuristic keeps deferral working there.
+    rows = launch_turn_rows("toolu_bg")
+    rows[2].pop("toolUseResult", None)
+    turns = hook_module.build_turns(rows)
+    state = hook_module.SessionState()
+
+    turns_to_emit = hook_module.get_turns_to_emit(turns, state)
+
+    assert turns_to_emit == []
+    assert len(state.pending_agent_turns) == 1

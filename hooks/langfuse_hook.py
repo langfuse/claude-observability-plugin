@@ -637,7 +637,25 @@ def get_tool_result_text(tool_result_entry: Any) -> str:
         return tool_result_content
     return json.dumps(tool_result_content, ensure_ascii=False)
 
+def get_async_launch_flag_from_row(row: Dict[str, Any]) -> Optional[bool]:
+    """Read the structured async marker Claude Code puts on tool_result rows.
+
+    Returns None when the row carries no toolUseResult (older Claude Code
+    versions), so callers can fall back to the launch-text heuristic.
+    """
+    tool_use_result = row.get("toolUseResult")
+    if not isinstance(tool_use_result, dict):
+        return None
+    return tool_use_result.get("status") == "async_launched" or tool_use_result.get("isAsync") is True
+
 def is_async_agent_launch_result(tool_result_entry: Any) -> bool:
+    if not isinstance(tool_result_entry, dict):
+        return False
+    # Prefer the structured toolUseResult marker: launch-text matching also
+    # fires on tool results that merely quote it (e.g. reading this file).
+    is_async_launch = tool_result_entry.get("is_async_launch")
+    if is_async_launch is not None:
+        return bool(is_async_launch)
     tool_result_text = get_tool_result_text(tool_result_entry)
     return (
         "Async agent launched successfully" in tool_result_text
@@ -648,10 +666,7 @@ def is_async_agent_launch_result(tool_result_entry: Any) -> bool:
         )
     )
 
-def get_pending_agent_tool_use_ids(
-    turn: Turn,
-    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> List[str]:
+def get_pending_agent_tool_use_ids(turn: Turn) -> List[str]:
     tool_use_ids: List[str] = []
     for assistant_message in turn.assistant_msgs:
         for tool_use_block in get_tool_use_blocks(get_content_from_row(assistant_message)):
@@ -663,24 +678,22 @@ def get_pending_agent_tool_use_ids(
             tool_result_entry = turn.tool_results_by_id.get(tool_use_id)
             if isinstance(tool_result_entry, dict) and tool_result_entry.get("final_content") is not None:
                 continue
-            has_subagent_transcript = (
-                subagent_transcripts_by_tool_use_id is not None
-                and tool_use_id in subagent_transcripts_by_tool_use_id
-            )
-            if has_subagent_transcript or is_async_agent_launch_result(tool_result_entry):
+            # Defer only explicit async launches: sync agents also write a
+            # subagent transcript but never notify, so deferring on transcript
+            # existence would strand their turns.
+            if is_async_agent_launch_result(tool_result_entry):
                 tool_use_ids.append(tool_use_id)
     return tool_use_ids
 
 def get_turns_to_emit(
     turns: List[Turn],
     session_state: SessionState,
-    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
     *,
     flush_deferred_agent_turns: bool = False,
 ) -> List[Turn]:
     turns_to_emit: List[Turn] = []
     for turn in turns:
-        pending_agent_tool_use_ids = get_pending_agent_tool_use_ids(turn, subagent_transcripts_by_tool_use_id)
+        pending_agent_tool_use_ids = get_pending_agent_tool_use_ids(turn)
         if pending_agent_tool_use_ids:
             if flush_deferred_agent_turns:
                 debug(f"Emitting async agent turn without task notification: {pending_agent_tool_use_ids}")
@@ -720,13 +733,17 @@ def add_tool_result_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
 
     state.current_rows.append(row)
     row_timestamp = row.get("timestamp")
+    is_async_launch = get_async_launch_flag_from_row(row)
     for tool_result_block in get_tool_result_blocks(get_content_from_row(row)):
         tool_use_id = tool_result_block.get("tool_use_id")
         if tool_use_id:
-            state.tool_results_by_id[str(tool_use_id)] = {
+            tool_result_entry: Dict[str, Any] = {
                 "content": tool_result_block.get("content"),
                 "timestamp": row_timestamp,
             }
+            if is_async_launch is not None:
+                tool_result_entry["is_async_launch"] = is_async_launch
+            state.tool_results_by_id[str(tool_use_id)] = tool_result_entry
     return True
 
 def add_task_notification_row(
@@ -1732,7 +1749,6 @@ def emit_new_turns_from_transcript(
         turns_to_emit = get_turns_to_emit(
             turns,
             session_state,
-            subagent_transcripts_by_tool_use_id,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
         )
         emitted = emit_ready_turns(
