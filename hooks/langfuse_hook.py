@@ -3,6 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "langfuse>=4.0,<5",
+#   "truststore>=0.9",
 # ]
 # ///
 """
@@ -23,6 +24,18 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+
+# ----------------- OS trust store (fail-open) -----------------
+# Verify TLS against the operating system's certificate store instead of only
+# the bundled certifi CAs, so self-hosted Langfuse instances behind a locally
+# trusted CA (mkcert, corporate proxy) work without extra configuration.
+# Must run before any library creates an SSLContext.
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+except Exception:
+    pass
 
 # ----------------- Langfuse import (fail-open) -----------------
 try:
