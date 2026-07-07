@@ -43,6 +43,9 @@ def _opt(name: str) -> str:
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
+# Emit subagent (Task/Agent) transcripts as nested generations under the tool span,
+# so their model + token usage (often a cheaper tier like Haiku) show up and get priced.
+CAPTURE_SUBAGENTS = (_opt("CC_LANGFUSE_SUBAGENTS") or "true").lower() == "true"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
@@ -505,10 +508,13 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
         # tool_result rows show up as role=user with content blocks of type tool_result
         if is_tool_result(row):
             row_ts = row.get("timestamp")
+            # Row-level toolUseResult carries subagent metadata (agentId, usage) for Task/Agent
+            # tool calls; keep it so emit can locate and inline the subagent transcript.
+            row_tool_meta = row.get("toolUseResult") if isinstance(row.get("toolUseResult"), dict) else None
             for tr in get_tool_result_blocks(get_content_from_row(row)):
                 tid = tr.get("tool_use_id")
                 if tid:
-                    tool_results_by_id[str(tid)] = {"content": tr.get("content"), "timestamp": row_ts}
+                    tool_results_by_id[str(tid)] = {"content": tr.get("content"), "timestamp": row_ts, "meta": row_tool_meta}
             continue
 
         if role == "user":
@@ -614,6 +620,112 @@ def short_session_label(session_id: str, max_len: int = 12) -> str:
 
 def trace_display_name(session_id: str, turn_num: int) -> str:
     return f"Claude Code - Turn {turn_num} ({short_session_label(session_id)})"
+
+
+def subagent_transcript_path(transcript_path: Path, agent_id: str) -> Path:
+    """Locate a subagent's transcript from the main transcript path and its agentId.
+
+    Claude Code writes subagent (Task/Agent) transcripts to
+    ``<dir>/<session_id>/subagents/agent-<agentId>.jsonl`` alongside the main
+    ``<dir>/<session_id>.jsonl``.
+    """
+    return transcript_path.parent / transcript_path.stem / "subagents" / f"agent-{agent_id}.jsonl"
+
+
+def parse_subagent_generations(path: Path) -> List[Dict[str, Any]]:
+    """Read a subagent transcript and return its assistant messages, merged by message.id.
+
+    Each returned row is a full transcript row (same shape as a main-transcript
+    assistant row) so callers can reuse ``get_model`` / ``get_usage_details_from_row``
+    / ``extract_text``. Fail-open: unreadable or missing files yield ``[]``.
+    """
+    try:
+        if not path.exists():
+            return []
+        rows: List[Dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        debug(f"parse_subagent_generations failed for {path}: {e}")
+        return []
+
+    # Group assistant rows by message.id and merge, mirroring build_turns so that a
+    # message split across rows is counted (and priced) once.
+    ordered_ids: List[str] = []
+    rows_by_id: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("isMeta"):
+            continue
+        if get_user_or_assistant_role_from_row(row) != "assistant":
+            continue
+        mid = get_message_id(row) or f"noid:{len(ordered_ids)}"
+        if mid not in rows_by_id:
+            ordered_ids.append(mid)
+            rows_by_id[mid] = []
+        rows_by_id[mid].append(row)
+
+    merged: List[Dict[str, Any]] = []
+    for mid in ordered_ids:
+        rows_for_id = rows_by_id.get(mid)
+        if rows_for_id:
+            merged.append(merge_assistant_rows(rows_for_id))
+    return merged
+
+
+def emit_subagent_generations(langfuse: Langfuse, parent_otel_span: Any, tool_meta: Dict[str, Any],
+                              transcript_path: Path, fallback_ts: Optional[datetime]) -> None:
+    """Emit a Task/Agent subagent's assistant messages as generations nested under its tool span.
+
+    Surfaces the subagent's real model (often a cheaper tier) and token usage so
+    Langfuse prices them, instead of leaving the tool span at zero cost.
+    """
+    agent_id = tool_meta.get("agentId")
+    if not agent_id:
+        return
+    sub_path = subagent_transcript_path(transcript_path, str(agent_id))
+    sub_msgs = parse_subagent_generations(sub_path)
+    if not sub_msgs:
+        debug(f"no subagent generations for agent {agent_id} at {sub_path}")
+        return
+
+    agent_type = tool_meta.get("agentType") or "subagent"
+    prev_ts: Optional[datetime] = None
+    for idx, am in enumerate(sub_msgs):
+        am_ts = parse_timestamp(am) or prev_ts or fallback_ts
+        am_text, am_text_meta = truncate_text(extract_text(get_content_from_row(am)))
+        gen_kwargs: Dict[str, Any] = dict(
+            model=get_model(am),
+            input=None,
+            output={"role": "assistant", "content": am_text} if am_text else {"role": "assistant"},
+            metadata={
+                "subagent": True,
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "assistant_index": idx,
+                "assistant_text": am_text_meta,
+            },
+        )
+        usage_details = get_usage_details_from_row(am)
+        if usage_details is not None:
+            gen_kwargs["usage_details"] = usage_details
+        sub_gen = _start_backdated(
+            langfuse,
+            name=f"Subagent[{agent_type}] Generation {idx + 1}",
+            as_type="generation",
+            start_time=prev_ts or am_ts,
+            parent_otel_span=parent_otel_span,
+            **gen_kwargs,
+        )
+        sub_gen.end(end_time=_to_ns(am_ts or prev_ts or fallback_ts))
+        if am_ts is not None:
+            prev_ts = am_ts
 
 
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
@@ -787,6 +899,18 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
                     },
                 )
                 tool_span.update(output=tool_output)
+
+                # For Task/Agent tools, inline the subagent's own generations (real model +
+                # token usage) as children of this tool span. Without this they are invisible
+                # and the tool span shows zero cost.
+                if CAPTURE_SUBAGENTS and tname in ("Task", "Agent"):
+                    tool_meta = tr_entry.get("meta") if tr_entry else None
+                    if isinstance(tool_meta, dict):
+                        emit_subagent_generations(
+                            langfuse, tool_span._otel_span, tool_meta, transcript_path,
+                            fallback_ts=tr_ts or am_ts,
+                        )
+
                 tool_span.end(end_time=_to_ns(tr_ts or am_ts))
 
                 batch_tool_results.append({

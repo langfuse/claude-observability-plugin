@@ -56,6 +56,12 @@
       "title": "Capture skill instructions",
       "description": "Include the injected skill instruction text in the Skill tool span output",
       "default": false
+    },
+    "CC_LANGFUSE_SUBAGENTS": {
+      "type": "boolean",
+      "title": "Trace subagents",
+      "description": "Inline Task/Agent subagent transcripts as nested generations under their tool span, so their model and token usage (often a cheaper tier) are traced and priced",
+      "default": true
     }
   }
 }
