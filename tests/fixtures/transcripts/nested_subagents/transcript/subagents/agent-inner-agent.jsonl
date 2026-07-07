@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-01-01T00:05:02.750Z","sessionId":"session-nested","agentId":"inner-agent","uuid":"subagent-inner-user-1","message":{"role":"user","content":"Return inner result"}}
+{"type":"assistant","timestamp":"2026-01-01T00:05:04.500Z","sessionId":"session-nested","agentId":"inner-agent","uuid":"subagent-inner-assistant-1","requestId":"req-subagent-inner-1","message":{"id":"msg-subagent-inner-1","role":"assistant","model":"claude-test","content":[{"type":"text","text":"Inner result."}]}}

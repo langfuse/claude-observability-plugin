@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-01-01T00:03:01.500Z","sessionId":"session-agent-deferred","agentId":"agent-deferred","uuid":"subagent-deferred-user-1","message":{"role":"user","content":"Research slowly"}}
+{"type":"assistant","timestamp":"2026-01-01T00:03:04.000Z","sessionId":"session-agent-deferred","agentId":"agent-deferred","uuid":"subagent-deferred-assistant-1","requestId":"req-subagent-deferred-1","message":{"id":"msg-subagent-deferred-1","role":"assistant","model":"claude-test","content":[{"type":"text","text":"Partial research note."}]}}
