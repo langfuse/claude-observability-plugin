@@ -556,48 +556,78 @@ def get_result_from_task_notification(row: Dict[str, Any]) -> str:
     result = _extract_xml_tag_value(notification_text, "result")
     return result if result is not None else notification_text
 
-def pop_deferred_agent_turn_rows(
+def _find_pending_agent_turn(
     session_state: SessionState,
-    tool_use_ids: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    selected_tool_use_ids = set(tool_use_ids) if tool_use_ids is not None else None
-    rows_to_prepend: List[Dict[str, Any]] = []
-    remaining_pending_agent_turns: List[Dict[str, Any]] = []
-
+    tool_use_id: str,
+) -> Optional[Dict[str, Any]]:
     for pending_turn in session_state.pending_agent_turns:
         if not isinstance(pending_turn, dict):
             continue
+        if not isinstance(pending_turn.get("rows"), list):
+            continue
         pending_tool_use_ids = pending_turn.get("pending_tool_use_ids")
-        rows = pending_turn.get("rows")
-        if not isinstance(pending_tool_use_ids, list) or not isinstance(rows, list):
-            continue
-        should_pop = (
-            selected_tool_use_ids is None
-            or any(tool_use_id in selected_tool_use_ids for tool_use_id in pending_tool_use_ids)
-        )
-        if should_pop:
-            rows_to_prepend.extend(rows)
-            continue
-        remaining_pending_agent_turns.append(pending_turn)
+        resolved_tool_use_ids = pending_turn.get("resolved_tool_use_ids")
+        # Notifications can arrive more than once per tool_use_id, so ids that
+        # already received one keep matching until the whole turn resolves.
+        if isinstance(pending_tool_use_ids, list) and tool_use_id in pending_tool_use_ids:
+            return pending_turn
+        if isinstance(resolved_tool_use_ids, list) and tool_use_id in resolved_tool_use_ids:
+            return pending_turn
+    return None
 
-    session_state.pending_agent_turns = remaining_pending_agent_turns
-
-    return rows_to_prepend
-
-def prepend_deferred_agent_turn_rows(
+def resolve_deferred_agent_turns(
     rows: List[Dict[str, Any]],
     session_state: SessionState,
     task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Move task-notification rows from the batch to their deferred turns.
+
+    Deferred rows are never spliced into the batch (a user row mid-batch would
+    cut the current turn in half); resolved turns are returned for isolated
+    assembly, unmatched notifications stay in the batch.
+    """
     if not session_state.pending_agent_turns:
-        return rows
-    rows_with_deferred_turns: List[Dict[str, Any]] = []
+        return [], rows
+
+    remaining_rows: List[Dict[str, Any]] = []
     for row in rows:
         tool_use_id = get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
-        if tool_use_id:
-            rows_with_deferred_turns.extend(pop_deferred_agent_turn_rows(session_state, [tool_use_id]))
-        rows_with_deferred_turns.append(row)
-    return rows_with_deferred_turns
+        pending_turn = _find_pending_agent_turn(session_state, tool_use_id) if tool_use_id else None
+        if pending_turn is None:
+            remaining_rows.append(row)
+            continue
+        pending_turn["rows"].append(row)
+        pending_tool_use_ids = pending_turn.get("pending_tool_use_ids")
+        if isinstance(pending_tool_use_ids, list) and tool_use_id in pending_tool_use_ids:
+            pending_tool_use_ids.remove(tool_use_id)
+            pending_turn.setdefault("resolved_tool_use_ids", []).append(tool_use_id)
+
+    # Pop fully resolved turns in deferral (i.e. chronological) order.
+    resolved_turn_row_lists: List[List[Dict[str, Any]]] = []
+    still_pending: List[Dict[str, Any]] = []
+    for pending_turn in session_state.pending_agent_turns:
+        if not isinstance(pending_turn, dict) or not isinstance(pending_turn.get("rows"), list):
+            continue
+        if pending_turn.get("pending_tool_use_ids"):
+            still_pending.append(pending_turn)
+            continue
+        resolved_turn_row_lists.append(pending_turn["rows"])
+    session_state.pending_agent_turns = still_pending
+
+    return resolved_turn_row_lists, remaining_rows
+
+def pop_all_deferred_agent_turn_row_lists(
+    session_state: SessionState,
+) -> List[List[Dict[str, Any]]]:
+    row_lists: List[List[Dict[str, Any]]] = []
+    for pending_turn in session_state.pending_agent_turns:
+        if not isinstance(pending_turn, dict):
+            continue
+        rows = pending_turn.get("rows")
+        if isinstance(rows, list) and rows:
+            row_lists.append(rows)
+    session_state.pending_agent_turns = []
+    return row_lists
 
 def get_tool_result_text(tool_result_entry: Any) -> str:
     if not isinstance(tool_result_entry, dict):
@@ -863,19 +893,24 @@ def get_new_turns_from_transcript(
     rows, session_state = read_new_jsonl(transcript_path, session_state)
     task_id_to_tool_use_id = get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id)
 
-    if rows:
-        rows = prepend_deferred_agent_turn_rows(rows, session_state, task_id_to_tool_use_id)
+    deferred_turn_row_lists, rows = resolve_deferred_agent_turns(rows, session_state, task_id_to_tool_use_id)
 
     if flush_deferred_agent_turns and session_state.pending_agent_turns:
-        deferred_rows = pop_deferred_agent_turn_rows(session_state)
-        if deferred_rows:
-            debug(f"Flushing {len(deferred_rows)} deferred agent row(s) without task notification")
-            rows = deferred_rows + rows
+        flushed_row_lists = pop_all_deferred_agent_turn_row_lists(session_state)
+        if flushed_row_lists:
+            debug(f"Flushing {len(flushed_row_lists)} deferred agent turn(s) without task notification")
+            deferred_turn_row_lists = deferred_turn_row_lists + flushed_row_lists
 
-    if not rows:
-        return [], session_state
+    # Each deferred row list is a complete turn from an earlier hook run, so
+    # it is rebuilt in isolation and emitted before the current batch (its
+    # rows are always chronologically older than anything in the batch).
+    turns: List[Turn] = []
+    for deferred_turn_rows in deferred_turn_row_lists:
+        turns.extend(build_turns(deferred_turn_rows, task_id_to_tool_use_id))
+    if rows:
+        turns.extend(build_turns(rows, task_id_to_tool_use_id))
 
-    return build_turns(rows, task_id_to_tool_use_id), session_state
+    return turns, session_state
 
 def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
     """Map launching Agent/Task tool_use ids to their subagent transcripts."""
