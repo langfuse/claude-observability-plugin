@@ -1477,10 +1477,8 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     path = subagent.get("path")
     if not isinstance(path, Path):
         return start_timestamp
-    try:
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    except Exception as e:
-        info(f"subagent transcript read failed ({path}): {type(e).__name__}: {e}")
+    rows = read_subagent_jsonl(path)
+    if rows is None:
         return start_timestamp
 
     turns = build_turns(rows)
@@ -1535,6 +1533,29 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     )
 
     return latest_end_timestamp
+
+def read_subagent_jsonl(path: Path) -> Optional[List[Dict[str, Any]]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        info(f"subagent transcript read failed ({path}): {type(e).__name__}: {e}")
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception as e:
+            info(f"subagent transcript line skipped ({path}:{line_number}): {type(e).__name__}: {e}")
+            continue
+        if not isinstance(row, dict):
+            info(f"subagent transcript line skipped ({path}:{line_number}): expected JSON object")
+            continue
+        rows.append(row)
+    return rows
 
 def get_turn_end_timestamp(turn: Turn) -> Optional[datetime]:
     last_assistant_timestamp = parse_timestamp(turn.assistant_msgs[-1]) if turn.assistant_msgs else None
