@@ -271,6 +271,10 @@ class SessionState:
     # Task-notification rows whose tool_use_id could not be resolved yet
     # (task-id-only and the subagent meta.json not on disk); retried each run.
     pending_task_notifications: List[Dict[str, Any]] = field(default_factory=list)
+    # Rows of the trailing turn of the last batch. Stop fires multiple times
+    # within one logical turn (task notifications, blocking hooks), so the
+    # trailing turn stays open until a new user row or SessionEnd closes it.
+    open_turn_rows: List[Dict[str, Any]] = field(default_factory=list)
 
 def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
@@ -280,12 +284,16 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     pending_task_notifications = s.get("pending_task_notifications")
     if not isinstance(pending_task_notifications, list):
         pending_task_notifications = []
+    open_turn_rows = s.get("open_turn_rows")
+    if not isinstance(open_turn_rows, list):
+        open_turn_rows = []
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
         turn_count=int(s.get("turn_count", 0)),
         pending_agent_turns=pending_agent_turns,
         pending_task_notifications=pending_task_notifications,
+        open_turn_rows=open_turn_rows,
     )
 
 def update_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
@@ -295,6 +303,7 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "turn_count": session_state.turn_count,
         "pending_agent_turns": session_state.pending_agent_turns or [],
         "pending_task_notifications": session_state.pending_task_notifications or [],
+        "open_turn_rows": session_state.open_turn_rows or [],
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -611,15 +620,15 @@ def resolve_deferred_agent_turns(
             pending_turn.setdefault("resolved_tool_use_ids", []).append(tool_use_id)
 
     # Retry stashed notifications from earlier runs first (they are older than
-    # anything in the batch); their task-id may resolve now.
+    # anything in the batch); their task-id may resolve now. Entries matching
+    # no deferred turn stay stashed: their owning turn may still be open and
+    # only defer once a new user row closes it. Leftovers are cleared at
+    # session end and the stash is size-capped.
     for row in session_state.pending_task_notifications:
         tool_use_id = get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
-        if tool_use_id is None:
-            stashed_notifications.append(row)
-            continue
-        pending_turn = _find_pending_agent_turn(session_state, tool_use_id)
+        pending_turn = _find_pending_agent_turn(session_state, tool_use_id) if tool_use_id else None
         if pending_turn is None:
-            debug(f"Dropping stashed task notification for {tool_use_id}: no deferred turn waits for it")
+            stashed_notifications.append(row)
             continue
         route_to_pending_turn(pending_turn, row, tool_use_id)
 
@@ -787,27 +796,41 @@ def add_task_notification_row(
     row: Dict[str, Any],
     state: TurnAssemblyState,
     task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+    closed_turns: Optional[List[Turn]] = None,
 ) -> bool:
     if not is_task_notification_row(row):
         return False
 
-    if state.current_turn_user_row is None:
-        return True
-
     tool_use_id = get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
     if not tool_use_id:
-        state.current_rows.append(row)
+        if state.current_turn_user_row is not None:
+            state.current_rows.append(row)
         return True
 
-    existing_result = state.tool_results_by_id.get(tool_use_id)
-    if isinstance(existing_result, dict):
-        existing_result["final_content"] = get_result_from_task_notification(row)
-        existing_result["final_timestamp"] = row.get("timestamp")
-    else:
-        state.tool_results_by_id[tool_use_id] = {
-            "content": get_result_from_task_notification(row),
-            "timestamp": row.get("timestamp"),
-        }
+    if state.current_turn_user_row is not None:
+        existing_result = state.tool_results_by_id.get(tool_use_id)
+        if isinstance(existing_result, dict):
+            existing_result["final_content"] = get_result_from_task_notification(row)
+            existing_result["final_timestamp"] = row.get("timestamp")
+            state.current_rows.append(row)
+            return True
+
+    # The launching turn may have been closed earlier in this same batch (a
+    # new user row arrived before the notification did).
+    for closed_turn in reversed(closed_turns or []):
+        closed_result = closed_turn.tool_results_by_id.get(tool_use_id)
+        if isinstance(closed_result, dict):
+            closed_result["final_content"] = get_result_from_task_notification(row)
+            closed_result["final_timestamp"] = row.get("timestamp")
+            closed_turn.rows.append(row)
+            return True
+
+    if state.current_turn_user_row is None:
+        return True
+    state.tool_results_by_id[tool_use_id] = {
+        "content": get_result_from_task_notification(row),
+        "timestamp": row.get("timestamp"),
+    }
     state.current_rows.append(row)
     return True
 
@@ -891,16 +914,21 @@ def add_assistant_row(row: Dict[str, Any], state: TurnAssemblyState) -> None:
     state.current_rows.append(row)
 
 
-def build_turns(
+def assemble_turns(
     rows: List[Dict[str, Any]],
     task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
-) -> List[Turn]:
+) -> Tuple[List[Turn], Optional[Turn], List[Dict[str, Any]]]:
     """
     Groups incremental transcript rows into turns:
     user (non-tool-result) -> assistant messages -> (tool_result rows, possibly interleaved)
     Uses:
     - assistant rows merged by message.id (all content blocks concatenated)
     - tool results dedupe by tool_use_id (latest wins)
+
+    Returns (closed_turns, trailing_turn, trailing_turn_rows). The trailing
+    turn is the one still open at the end of the rows: only a following user
+    row proves a turn is complete, so incremental callers keep its raw rows
+    and re-attach them to the next batch instead of emitting it right away.
     """
     turns: List[Turn] = []
     state = TurnAssemblyState()
@@ -912,7 +940,7 @@ def build_turns(
         if add_tool_result_row(row, state):
             continue
 
-        if add_task_notification_row(row, state, task_id_to_tool_use_id):
+        if add_task_notification_row(row, state, task_id_to_tool_use_id, closed_turns=turns):
             continue
 
         role = get_user_or_assistant_role_from_row(row)
@@ -931,9 +959,19 @@ def build_turns(
 
         # ignore unknown rows
 
-    turn = build_turn_from_state(state)
-    if turn is not None:
-        turns.append(turn)
+    trailing_turn = build_turn_from_state(state)
+    trailing_turn_rows = list(state.current_rows) if state.current_turn_user_row is not None else []
+    return turns, trailing_turn, trailing_turn_rows
+
+
+def build_turns(
+    rows: List[Dict[str, Any]],
+    task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+) -> List[Turn]:
+    """Group a complete row list into turns, including the trailing one."""
+    turns, trailing_turn, _ = assemble_turns(rows, task_id_to_tool_use_id)
+    if trailing_turn is not None:
+        turns.append(trailing_turn)
     return turns
 
 
@@ -947,6 +985,15 @@ def get_new_turns_from_transcript(
     rows, session_state = read_new_jsonl(transcript_path, session_state)
     task_id_to_tool_use_id = get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id)
 
+    # Re-attach the trailing open turn from the previous run. Stop fires
+    # multiple times within one logical turn, so a batch can begin with
+    # user-less continuation rows (task notifications, assistant rows); with
+    # the open turn's rows in front they attach to it instead of being
+    # dropped by turn assembly.
+    if session_state.open_turn_rows:
+        rows = session_state.open_turn_rows + rows
+        session_state.open_turn_rows = []
+
     deferred_turn_row_lists, rows = resolve_deferred_agent_turns(rows, session_state, task_id_to_tool_use_id)
 
     if flush_deferred_agent_turns and session_state.pending_agent_turns:
@@ -956,7 +1003,11 @@ def get_new_turns_from_transcript(
             deferred_turn_row_lists = deferred_turn_row_lists + flushed_row_lists
 
     if flush_deferred_agent_turns and session_state.pending_task_notifications:
-        debug(f"Dropping {len(session_state.pending_task_notifications)} unresolved task notification(s) at session end")
+        # Last chance: appended to the row stream, a stashed notification can
+        # still attach to the (reattached) open turn or a turn closed in this
+        # batch; anything unmatched is discarded with the session.
+        debug(f"Replaying {len(session_state.pending_task_notifications)} stashed task notification(s) at session end")
+        rows = rows + session_state.pending_task_notifications
         session_state.pending_task_notifications = []
 
     # Each deferred row list is a complete turn from an earlier hook run, so
@@ -965,8 +1016,18 @@ def get_new_turns_from_transcript(
     turns: List[Turn] = []
     for deferred_turn_rows in deferred_turn_row_lists:
         turns.extend(build_turns(deferred_turn_rows, task_id_to_tool_use_id))
-    if rows:
-        turns.extend(build_turns(rows, task_id_to_tool_use_id))
+
+    batch_turns, trailing_turn, trailing_turn_rows = assemble_turns(rows, task_id_to_tool_use_id)
+    turns.extend(batch_turns)
+
+    if flush_deferred_agent_turns:
+        # SessionEnd: nothing can continue the trailing turn anymore.
+        if trailing_turn is not None:
+            turns.append(trailing_turn)
+    else:
+        session_state.open_turn_rows = trailing_turn_rows
+        if trailing_turn_rows:
+            debug(f"Holding trailing open turn ({len(trailing_turn_rows)} row(s)) until a new user row closes it")
 
     return turns, session_state
 

@@ -12,6 +12,8 @@ def test_emit_new_turns_from_completed_async_agent_transcript(
     transcript = fixture_transcript_path("async_agent_completed")
     config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
 
+    # First Stop: the trailing turn could still be continued (Stop fires
+    # multiple times within one logical turn), so it is held open.
     emitted = hook_module.emit_new_turns_from_transcript(
         fake_langfuse,
         config,
@@ -19,11 +21,25 @@ def test_emit_new_turns_from_completed_async_agent_transcript(
         transcript,
     )
 
+    assert emitted == 0
+    state = json.loads((isolated_hook_state / "langfuse_state.json").read_text(encoding="utf-8"))
+    assert next(iter(state.values()))["open_turn_rows"] != []
+
+    # SessionEnd closes it.
+    emitted = hook_module.emit_new_turns_from_transcript(
+        fake_langfuse,
+        config,
+        "session-agent-complete",
+        transcript,
+        flush_deferred_agent_turns=True,
+    )
+
     assert emitted == 1
     assert any(observation.name == "Conversational Turn" for observation in fake_langfuse.observations)
     state = json.loads((isolated_hook_state / "langfuse_state.json").read_text(encoding="utf-8"))
     assert next(iter(state.values()))["turn_count"] == 1
     assert next(iter(state.values()))["pending_agent_turns"] == []
+    assert next(iter(state.values()))["open_turn_rows"] == []
 
 
 def test_emit_new_turns_defers_async_agent_until_session_end_flush(
@@ -42,11 +58,12 @@ def test_emit_new_turns_defers_async_agent_until_session_end_flush(
         transcript,
     )
 
+    # The trailing turn is held open (its async agent may still notify and
+    # Claude may continue), so it is neither emitted nor deferred yet.
     assert emitted == 0
     state = json.loads((isolated_hook_state / "langfuse_state.json").read_text(encoding="utf-8"))
-    pending_agent_turns = next(iter(state.values()))["pending_agent_turns"]
-    assert len(pending_agent_turns) == 1
-    assert pending_agent_turns[0]["pending_tool_use_ids"] == ["toolu_agent_deferred"]
+    assert next(iter(state.values()))["pending_agent_turns"] == []
+    assert next(iter(state.values()))["open_turn_rows"] != []
 
     emitted = hook_module.emit_new_turns_from_transcript(
         fake_langfuse,
