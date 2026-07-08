@@ -468,6 +468,12 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
             debug(f"transcript shrank ({file_size} < {session_state.offset}); restarting")
             session_state.offset = 0
             session_state.buffer = ""
+            # The held rows refer to the replaced file; re-reading from byte 0
+            # would emit those turns a second time (and mix old rows into the
+            # new stream), so drop all persisted turn state along with the offset.
+            session_state.pending_agent_turns = []
+            session_state.pending_task_notifications = []
+            session_state.open_turn_rows = []
         with open(transcript_path, "rb") as f:
             f.seek(session_state.offset)
             chunk = f.read()
