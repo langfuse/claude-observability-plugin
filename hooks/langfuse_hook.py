@@ -221,6 +221,31 @@ def extract_session_id_and_transcript_path(payload: Dict[str, Any]) -> Tuple[Opt
 
     return session_id, transcript_path
 
+def resolve_transcript_path(session_id: str, transcript_path: Path, payload: Dict[str, Any]) -> Path:
+    """Recover from Claude Desktop emitting a non-existent, home-scoped transcript path."""
+    if transcript_path.exists():
+        return transcript_path
+
+    projects_dir = Path.home() / ".claude" / "projects"
+    candidates = list(projects_dir.glob(f"*/{session_id}.jsonl"))
+    if not candidates:
+        return transcript_path
+
+    cwd_raw = payload.get("cwd")
+    if isinstance(cwd_raw, str) and cwd_raw:
+        encoded_cwd = cwd_raw.replace("/", "-").replace("_", "-")
+        cwd_matches = [p for p in candidates if p.parent.name == encoded_cwd]
+        if len(cwd_matches) == 1:
+            debug(f"Recovered transcript path from cwd: {cwd_matches[0]}")
+            return cwd_matches[0].resolve()
+
+    if len(candidates) == 1:
+        debug(f"Recovered unique transcript path: {candidates[0]}")
+        return candidates[0].resolve()
+
+    debug(f"Transcript recovery was ambiguous for session {session_id}: {len(candidates)} candidates")
+    return transcript_path
+
 # ----------------- Transcript parsing helpers -----------------
 def get_content_from_row(row: Dict[str, Any]) -> Any:
     if not isinstance(row, dict):
@@ -812,6 +837,41 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
         trace_span.update(output={"role": "assistant", "content": final_assistant_text})
         trace_span.end(end_time=_to_ns(turn_end_ts or last_assistant_ts or user_ts))
 
+def process_transcript(langfuse: Langfuse, state: Dict[str, Any], session_id: str,
+                       transcript_path: Path, user_id: Optional[str]) -> int:
+    """Upload only the unread portion of one main-agent or subagent transcript."""
+    key = state_key(session_id, str(transcript_path))
+    ss = load_session_state(state, key)
+    msgs, ss = read_new_jsonl(transcript_path, ss)
+    if not msgs:
+        write_session_state(state, key, ss)
+        return 0
+
+    turns = build_turns(msgs)
+    emitted = 0
+    for turn in turns:
+        emitted += 1
+        turn_num = ss.turn_count + emitted
+        try:
+            emit_turn(langfuse, session_id, turn_num, turn, transcript_path, user_id=user_id)
+        except Exception as e:
+            info(f"emit_turn failed: {type(e).__name__}: {e}")
+
+    ss.turn_count += emitted
+    write_session_state(state, key, ss)
+    return emitted
+
+def subagent_transcripts(transcript_path: Path, parent_session_id: str) -> List[Tuple[str, Path]]:
+    """Return Claude Desktop subagent files that are not exposed as usable hook paths."""
+    root = transcript_path.parent / parent_session_id / "subagents"
+    if not root.is_dir():
+        return []
+    out: List[Tuple[str, Path]] = []
+    for path in sorted(root.glob("**/agent-*.jsonl")):
+        agent_id = path.stem
+        out.append((f"{parent_session_id}:{agent_id}", path.resolve()))
+    return out
+
 # ----------------- Main -----------------
 def main() -> int:
     start = time.time()
@@ -833,6 +893,8 @@ def main() -> int:
         debug("Missing session_id or transcript_path from hook payload; exiting.")
         return 0
 
+    transcript_path = resolve_transcript_path(session_id, transcript_path, payload)
+
     if not transcript_path.exists():
         debug(f"Transcript path does not exist: {transcript_path}")
         return 0
@@ -846,40 +908,22 @@ def main() -> int:
     try:
         with FileLock(LOCK_FILE):
             state = load_state()
-            key = state_key(session_id, str(transcript_path))
-            ss = load_session_state(state, key)
-
-            msgs, ss = read_new_jsonl(transcript_path, ss)
-            if not msgs:
-                write_session_state(state, key, ss)
-                save_state(state)
-                return 0
-
-            turns = build_turns(msgs)
-            if not turns:
-                write_session_state(state, key, ss)
-                save_state(state)
-                return 0
-
-            # emit turns
-            emitted = 0
-            for t in turns:
-                emitted += 1
-                turn_num = ss.turn_count + emitted
-                try:
-                    emit_turn(langfuse, session_id, turn_num, t, transcript_path, user_id=user_id)
-                except Exception as e:
-                    # Log at INFO so SDK incompatibilities (and other emit failures)
-                    # are visible without needing CC_LANGFUSE_DEBUG=true.
-                    info(f"emit_turn failed: {type(e).__name__}: {e}")
-                    # continue emitting other turns
-
-            ss.turn_count += emitted
-            write_session_state(state, key, ss)
+            emitted = process_transcript(langfuse, state, session_id, transcript_path, user_id)
+            subagent_emitted = 0
+            for child_session_id, child_path in subagent_transcripts(transcript_path, session_id):
+                subagent_emitted += process_transcript(
+                    langfuse, state, child_session_id, child_path, user_id
+                )
+                # Desktop workflows can create hundreds of agents. Flush after
+                # every file so the bounded SDK queue cannot silently drop spans.
+                langfuse.flush()
             save_state(state)
 
         dur = time.time() - start
-        info(f"Processed {emitted} turns in {dur:.2f}s (session={session_id})")
+        info(
+            f"Processed {emitted} main turns and {subagent_emitted} subagent turns "
+            f"in {dur:.2f}s (session={session_id})"
+        )
         return 0
 
     except TimeoutError as e:
