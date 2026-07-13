@@ -23,7 +23,7 @@ def test_emit_new_turns_from_completed_async_agent_transcript(
 
     assert emitted == 0
     state = json.loads((isolated_hook_state / "langfuse_state.json").read_text(encoding="utf-8"))
-    assert next(iter(state.values()))["open_turn_rows"] != []
+    assert next(iter(state.values()))["open_turn"]["rows"]
 
     # SessionEnd closes it.
     emitted = hook_module.emit_new_turns_from_transcript(
@@ -39,7 +39,7 @@ def test_emit_new_turns_from_completed_async_agent_transcript(
     state = json.loads((isolated_hook_state / "langfuse_state.json").read_text(encoding="utf-8"))
     assert next(iter(state.values()))["turn_count"] == 1
     assert next(iter(state.values()))["pending_agent_turns"] == []
-    assert next(iter(state.values()))["open_turn_rows"] == []
+    assert next(iter(state.values()))["open_turn"] == {}
 
 
 def test_emit_new_turns_defers_async_agent_until_session_end_flush(
@@ -63,7 +63,7 @@ def test_emit_new_turns_defers_async_agent_until_session_end_flush(
     assert emitted == 0
     state = json.loads((isolated_hook_state / "langfuse_state.json").read_text(encoding="utf-8"))
     assert next(iter(state.values()))["pending_agent_turns"] == []
-    assert next(iter(state.values()))["open_turn_rows"] != []
+    assert next(iter(state.values()))["open_turn"]["rows"]
 
     emitted = hook_module.emit_new_turns_from_transcript(
         fake_langfuse,

@@ -85,7 +85,7 @@ def test_rotation_clears_persisted_turn_state_and_avoids_duplicate_turns(hook_mo
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state)
     emitted += hook_module.get_turns_to_emit(turns, state)
     assert [t.user_msg["uuid"] for t in emitted] == ["turn-a-user"]
-    assert state.open_turn_rows != []
+    assert state.open_turn.get("rows")
     assert state.offset > 0
 
     # Rotation: the file is replaced by a SHORTER one that still contains the
@@ -100,4 +100,4 @@ def test_rotation_clears_persisted_turn_state_and_avoids_duplicate_turns(hook_mo
     assert [t.user_msg["uuid"] for t in emitted] == ["turn-a-user", "turn-b-user"]
     assert state.pending_agent_turns == []
     assert state.pending_task_notifications == []
-    assert state.open_turn_rows == []
+    assert state.open_turn == {}

@@ -272,10 +272,9 @@ class SessionState:
     # Task-notification rows whose tool_use_id could not be resolved yet
     # (task-id-only and the subagent meta.json not on disk); retried each run.
     pending_task_notifications: List[Dict[str, Any]] = field(default_factory=list)
-    # Rows of the trailing turn of the last batch. Stop fires multiple times
-    # within one logical turn (task notifications, blocking hooks), so the
-    # trailing turn stays open until a new user row or SessionEnd closes it.
-    open_turn_rows: List[Dict[str, Any]] = field(default_factory=list)
+    # Trailing turn kept while it may still continue; see build_open_turn
+    # for the structure (rows plus emission cursor).
+    open_turn: Dict[str, Any] = field(default_factory=dict)
     # Turn numbers assigned when a turn is first seen (keyed by its user-row
     # uuid), so a turn keeps its number regardless of when it is emitted.
     turn_numbers: Dict[str, int] = field(default_factory=dict)
@@ -288,9 +287,9 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     pending_task_notifications = s.get("pending_task_notifications")
     if not isinstance(pending_task_notifications, list):
         pending_task_notifications = []
-    open_turn_rows = s.get("open_turn_rows")
-    if not isinstance(open_turn_rows, list):
-        open_turn_rows = []
+    open_turn = s.get("open_turn")
+    if not isinstance(open_turn, dict):
+        open_turn = {}
     turn_numbers = s.get("turn_numbers")
     if not isinstance(turn_numbers, dict):
         turn_numbers = {}
@@ -300,7 +299,7 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
         turn_count=int(s.get("turn_count", 0)),
         pending_agent_turns=pending_agent_turns,
         pending_task_notifications=pending_task_notifications,
-        open_turn_rows=open_turn_rows,
+        open_turn=open_turn,
         turn_numbers=turn_numbers,
     )
 
@@ -311,7 +310,7 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "turn_count": session_state.turn_count,
         "pending_agent_turns": session_state.pending_agent_turns or [],
         "pending_task_notifications": session_state.pending_task_notifications or [],
-        "open_turn_rows": session_state.open_turn_rows or [],
+        "open_turn": session_state.open_turn or {},
         "turn_numbers": session_state.turn_numbers or {},
         "updated": datetime.now(timezone.utc).isoformat(),
     }
@@ -482,7 +481,7 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
             # new stream), so drop all persisted turn state along with the offset.
             session_state.pending_agent_turns = []
             session_state.pending_task_notifications = []
-            session_state.open_turn_rows = []
+            session_state.open_turn = {}
             session_state.turn_numbers = {}
         with open(transcript_path, "rb") as f:
             f.seek(session_state.offset)
@@ -991,6 +990,24 @@ def build_turns(
     return turns
 
 
+def build_open_turn(trailing_turn: Optional[Turn],
+                    trailing_turn_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Package the trailing turn for the session state; emitted_keys and
+    root_span_id are the (yet unused) slots for the emission cursor."""
+    if not trailing_turn_rows:
+        return {}
+    if trailing_turn is not None:
+        user_row_uuid = trailing_turn.user_msg.get("uuid")
+    else:
+        user_row_uuid = trailing_turn_rows[0].get("uuid")
+    return {
+        "user_row_uuid": user_row_uuid,
+        "rows": trailing_turn_rows,
+        "emitted_keys": [],
+        "root_span_id": None,
+    }
+
+
 def assign_turn_numbers(turns: List[Turn], trailing_turn: Optional[Turn],
                         session_state: SessionState) -> None:
     """Assigns each turn its number the first time it is seen (in transcript
@@ -1019,9 +1036,11 @@ def get_new_turns_from_transcript(
     # user-less continuation rows (task notifications, assistant rows); with
     # the open turn's rows in front they attach to it instead of being
     # dropped by turn assembly.
-    if session_state.open_turn_rows:
-        rows = session_state.open_turn_rows + rows
-        session_state.open_turn_rows = []
+    previous_open_turn = session_state.open_turn if isinstance(session_state.open_turn, dict) else {}
+    held_rows = previous_open_turn.get("rows")
+    if isinstance(held_rows, list) and held_rows:
+        rows = held_rows + rows
+        session_state.open_turn = {}
 
     deferred_turn_row_lists, rows = resolve_deferred_agent_turns(rows, session_state, task_id_to_tool_use_id)
 
@@ -1054,7 +1073,7 @@ def get_new_turns_from_transcript(
         if trailing_turn is not None:
             turns.append(trailing_turn)
     else:
-        session_state.open_turn_rows = trailing_turn_rows
+        session_state.open_turn = build_open_turn(trailing_turn, trailing_turn_rows)
         if trailing_turn_rows:
             debug(f"Holding trailing open turn ({len(trailing_turn_rows)} row(s)) until a new user row closes it")
 

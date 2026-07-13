@@ -119,7 +119,7 @@ def test_completed_async_agent_turn_is_ready_to_emit(
     # The trailing turn is held open on Stop; SessionEnd closes and emits it.
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state, subagents)
     assert turns == []
-    assert state.open_turn_rows != []
+    assert state.open_turn.get("rows")
 
     turns, state = hook_module.get_new_turns_from_transcript(
         transcript, state, subagents, flush_deferred_agent_turns=True)
@@ -128,7 +128,7 @@ def test_completed_async_agent_turn_is_ready_to_emit(
     assert len(turns) == 1
     assert len(turns_to_emit) == 1
     assert state.pending_agent_turns == []
-    assert state.open_turn_rows == []
+    assert state.open_turn == {}
     result = turns[0].tool_results_by_id["toolu_agent_complete"]
     assert result["final_content"] == "Subagent summary is ready."
 
@@ -148,7 +148,7 @@ def test_uncompleted_async_agent_turn_is_held_open_and_flushed_at_session_end(
     # not deferred: deferral applies to closed turns only.
     assert turns_to_emit == []
     assert state.pending_agent_turns == []
-    assert state.open_turn_rows != []
+    assert state.open_turn.get("rows")
 
     flushed_turns, state = hook_module.get_new_turns_from_transcript(
         transcript,
@@ -164,7 +164,7 @@ def test_uncompleted_async_agent_turn_is_held_open_and_flushed_at_session_end(
 
     assert len(flushed_to_emit) == 1
     assert state.pending_agent_turns == []
-    assert state.open_turn_rows == []
+    assert state.open_turn == {}
 
 
 def test_turn_waiting_on_multiple_agents_resolves_only_after_all_notifications(hook_module):
@@ -317,7 +317,7 @@ def test_mid_turn_notification_does_not_corrupt_the_surrounding_turn(hook_module
     append_jsonl(transcript, launch_turn_rows("toolu_bg"))
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state)
     assert hook_module.get_turns_to_emit(turns, state) == []
-    assert state.open_turn_rows != []
+    assert state.open_turn.get("rows")
 
     # Hook run 2: turn 2 is mid-flight when the notification lands between
     # two of its assistant messages (the normal real-world shape).
@@ -531,7 +531,7 @@ def test_unresolvable_notification_is_stashed_and_resolved_when_meta_appears(hoo
 
     append_jsonl(transcript, launch_turn_rows("toolu_bg"))
     assert run() == []
-    assert state.open_turn_rows != []
+    assert state.open_turn.get("rows")
 
     # Notification lands alone in the next batch; no meta.json on disk yet.
     append_jsonl(transcript, [
@@ -698,15 +698,17 @@ def test_async_turn_keeps_final_answer_arriving_after_notifications(hook_module,
     assert turn.tool_results_by_id["toolu_bg"]["final_content"] == "Agent result."
 
 
-def test_session_state_round_trips_open_turn_rows(hook_module):
+def test_session_state_round_trips_open_turn(hook_module):
     rows = launch_turn_rows("toolu_bg")
-    state = hook_module.SessionState(open_turn_rows=rows)
+    open_turn = {"user_row_uuid": "user-1", "rows": rows,
+                 "emitted_keys": ["msg-1"], "root_span_id": "a3f9c2d1e5b70468"}
+    state = hook_module.SessionState(open_turn=open_turn)
     global_state: dict[str, Any] = {}
 
     hook_module.update_session_state(global_state, "key", state)
     restored = hook_module.get_session_state(global_state, "key")
 
-    assert restored.open_turn_rows == rows
+    assert restored.open_turn == open_turn
 
 
 def test_stashed_notification_reaches_still_open_turn_at_session_end(hook_module, tmp_path):
@@ -741,4 +743,4 @@ def test_stashed_notification_reaches_still_open_turn_at_session_end(hook_module
     assert flushed[0].user_msg["uuid"] == "user-1"
     assert flushed[0].tool_results_by_id["toolu_bg"]["final_content"] == "Late result."
     assert state.pending_task_notifications == []
-    assert state.open_turn_rows == []
+    assert state.open_turn == {}
