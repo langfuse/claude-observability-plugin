@@ -1905,11 +1905,18 @@ def emit_ready_turns(
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
 ) -> int:
     emitted = 0
+    # Turns without a user-row uuid bypass assign_turn_numbers; seed their
+    # fallback from the same monotonic sequence so numbers never collide.
+    next_fallback_turn_number = 1 + max(
+        session_state.turn_count,
+        max(session_state.turn_numbers.values(), default=0),
+    )
     for turn in turns_to_emit:
         emitted += 1
-        turn_num = session_state.turn_numbers.get(
-            turn.user_msg.get("uuid"), session_state.turn_count + emitted
-        )
+        turn_num = session_state.turn_numbers.get(turn.user_msg.get("uuid"))
+        if turn_num is None:
+            turn_num = next_fallback_turn_number
+            next_fallback_turn_number += 1
         try:
             emit_turn(
                 langfuse,
