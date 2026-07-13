@@ -13,6 +13,7 @@ Claude Code -> Langfuse hook
 import json
 import logging
 import os
+import random
 import sys
 import threading
 import time
@@ -1752,6 +1753,28 @@ def build_trace_metadata(
             trace_metadata[dst_key] = value
     return trace_metadata
 
+def deterministic_trace_parent(langfuse: Langfuse, session_id: str, turn: Turn) -> Optional[Any]:
+    """Return a carrier span pinning the turn's trace id, seeded from session
+    id + the turn's user-row uuid."""
+    user_row_uuid = turn.user_msg.get("uuid")
+    if not isinstance(user_row_uuid, str) or not user_row_uuid:
+        return None
+    try:
+        trace_id = langfuse.create_trace_id(seed=f"{session_id}:{user_row_uuid}")
+        parent_context = otel_trace_api.SpanContext(
+            trace_id=int(trace_id, 16),
+            # The carrier is never exported; OTel merely requires a valid
+            # non-zero span id here.
+            span_id=random.getrandbits(64) or 1,
+            trace_flags=otel_trace_api.TraceFlags(0x01),  # sampled
+            is_remote=False,
+        )
+        return otel_trace_api.NonRecordingSpan(parent_context)
+    except Exception as e:
+        debug(f"deterministic_trace_parent failed, falling back to random trace id: {e}")
+        return None
+
+
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
               user_id: Optional[str] = None,
               subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
@@ -1781,6 +1804,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
             name=root_observation_name,
             as_type="span",
             start_time=user_ts,
+            parent_otel_span=deterministic_trace_parent(langfuse, session_id, turn),
             input={"role": "user", "content": user_text},
             metadata=trace_metadata,
         )
