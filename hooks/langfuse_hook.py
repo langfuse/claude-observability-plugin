@@ -13,6 +13,7 @@ Claude Code -> Langfuse hook
 import json
 import logging
 import os
+import random
 import sys
 import threading
 import time
@@ -61,12 +62,14 @@ class LangfuseConfig:
     secret_key: str
     host: str
     user_id: Optional[str]
+    trace_seed: Optional[str] = None
 
 def get_langfuse_config() -> Optional[LangfuseConfig]:
     public_key = _opt("LANGFUSE_PUBLIC_KEY") or _opt("CC_LANGFUSE_PUBLIC_KEY")
     secret_key = _opt("LANGFUSE_SECRET_KEY") or _opt("CC_LANGFUSE_SECRET_KEY")
     host = _opt("LANGFUSE_BASE_URL") or _opt("CC_LANGFUSE_BASE_URL") or "https://us.cloud.langfuse.com"
     user_id = _opt("LANGFUSE_USER_ID") or _opt("CC_LANGFUSE_USER_ID") or None
+    trace_seed = _opt("CC_LANGFUSE_TRACE_SEED") or None
 
     if not public_key or not secret_key:
         return None
@@ -76,6 +79,7 @@ def get_langfuse_config() -> Optional[LangfuseConfig]:
         secret_key=secret_key,
         host=host,
         user_id=user_id,
+        trace_seed=trace_seed,
     )
 
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
@@ -1030,9 +1034,79 @@ def _get_latest_timestamp(*timestamps: Optional[datetime]) -> Optional[datetime]
     present_timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
     return max(present_timestamps) if present_timestamps else None
 
+# ---- Deterministic trace ids ----
+def _is_valid_trace_id_hex(trace_id: Any) -> bool:
+    if not isinstance(trace_id, str) or len(trace_id) != 32:
+        return False
+    try:
+        return int(trace_id, 16) != 0
+    except ValueError:
+        return False
+
+def derive_turn_trace_id(trace_seed: str, turn_number: int) -> Optional[str]:
+    """Derive the deterministic W3C trace id for a turn from CC_LANGFUSE_TRACE_SEED.
+
+    Formula: Langfuse.create_trace_id(seed=f"{trace_seed}:{turn_number}") — which
+    is sha256(seed_string).hexdigest()[:32]. The explicit sha256 fallback keeps
+    IDs identical to what external callers precompute with the SDK helper even
+    if the helper itself is unavailable.
+    """
+    seed_string = f"{trace_seed}:{turn_number}"
+    try:
+        create_trace_id = getattr(Langfuse, "create_trace_id", None)
+        if callable(create_trace_id):
+            trace_id = create_trace_id(seed=seed_string)
+            if _is_valid_trace_id_hex(trace_id):
+                return trace_id.lower()
+    except Exception as e:
+        debug(f"Langfuse.create_trace_id failed for {seed_string!r}: {e}")
+    try:
+        return hashlib.sha256(seed_string.encode("utf-8")).hexdigest()[:32]
+    except Exception:
+        return None
+
+def _build_forced_trace_context(trace_id_hex: str) -> Optional[Any]:
+    """Build an OTel context whose remote parent carries the forced trace id.
+
+    A root span started within this context adopts the trace id; its children
+    keep inheriting it as usual. Returns None (caller falls back to an
+    auto-generated id) when the context cannot be built.
+    """
+    try:
+        trace_id = int(trace_id_hex, 16)
+        if trace_id == 0:
+            return None
+        span_id = 0
+        while span_id == 0:
+            span_id = random.getrandbits(64)
+        parent_span_context = otel_trace_api.SpanContext(
+            trace_id=trace_id,
+            span_id=span_id,
+            is_remote=True,
+            trace_flags=otel_trace_api.TraceFlags(otel_trace_api.TraceFlags.SAMPLED),
+        )
+        return otel_trace_api.set_span_in_context(
+            otel_trace_api.NonRecordingSpan(parent_span_context)
+        )
+    except Exception as e:
+        debug(f"forced trace context for {trace_id_hex!r} failed: {e}")
+        return None
+
+def _start_root_otel_span(langfuse: Langfuse, name: str, start_ns: Optional[int],
+                          forced_trace_id: Optional[str]) -> Any:
+    if forced_trace_id:
+        context = _build_forced_trace_context(forced_trace_id)
+        if context is not None:
+            try:
+                return langfuse._otel_tracer.start_span(name=name, start_time=start_ns, context=context)
+            except Exception as e:
+                debug(f"start_span with forced trace id {forced_trace_id!r} failed: {e}")
+    return langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+
 def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
                      start_time: Optional[datetime],
                      parent_otel_span: Any = None,
+                     forced_trace_id: Optional[str] = None,
                      **obs_kwargs: Any) -> Any:
     """Create a Langfuse observation with an explicit OTel start_time.
 
@@ -1060,7 +1134,7 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
         with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
             otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
     else:
-        otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+        otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id)
     return langfuse._create_observation_from_otel_span(
         otel_span=otel_span,
         as_type=as_type,
@@ -1687,7 +1761,8 @@ def build_trace_metadata(
 
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
               user_id: Optional[str] = None,
-              subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+              subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+              trace_seed: Optional[str] = None) -> None:
     user_text_raw = extract_text_from_content(get_content_from_row(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
 
@@ -1703,6 +1778,14 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
     trace_name = trace_display_name(session_id, turn_num)
     root_observation_name = "Conversational Turn"
 
+    # Opt-in deterministic trace ids: fail open to the auto-generated id.
+    forced_trace_id: Optional[str] = None
+    if trace_seed:
+        try:
+            forced_trace_id = derive_turn_trace_id(trace_seed, turn_num)
+        except Exception as e:
+            debug(f"trace id derivation failed for turn {turn_num}: {e}")
+
     with propagate_attributes(
         session_id=session_id,
         user_id=user_id,
@@ -1714,6 +1797,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
             name=root_observation_name,
             as_type="span",
             start_time=user_ts,
+            forced_trace_id=forced_trace_id,
             input={"role": "user", "content": user_text},
             metadata=trace_metadata,
         )
@@ -1738,6 +1822,7 @@ def emit_ready_turns(
     *,
     user_id: Optional[str],
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
+    trace_seed: Optional[str] = None,
 ) -> int:
     emitted = 0
     for turn in turns_to_emit:
@@ -1752,6 +1837,7 @@ def emit_ready_turns(
                 transcript_path,
                 user_id=user_id,
                 subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                trace_seed=trace_seed,
             )
         except Exception as e:
             # Log at INFO so SDK incompatibilities (and other emit failures)
@@ -1799,6 +1885,7 @@ def emit_new_turns_from_transcript(
             session_state,
             user_id=config.user_id,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            trace_seed=config.trace_seed,
         )
 
         session_state.turn_count += emitted
