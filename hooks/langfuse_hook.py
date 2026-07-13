@@ -1011,14 +1011,21 @@ def build_open_turn(trailing_turn: Optional[Turn],
 def assign_turn_numbers(turns: List[Turn], trailing_turn: Optional[Turn],
                         session_state: SessionState) -> None:
     """Assigns each turn its number the first time it is seen (in transcript
-    order). Keyed by the turn's user-row uuid."""
+    order). Keyed by the turn's user-row uuid. Numbering seeds past
+    max(turn_count, highest assigned) so a cleared or missing turn_numbers
+    dict (rotation, legacy state files) cannot restart numbering at 1."""
     trailing = [trailing_turn] if trailing_turn is not None else []
+    next_turn_number = 1 + max(
+        session_state.turn_count,
+        max(session_state.turn_numbers.values(), default=0),
+    )
     for turn in turns + trailing:
         user_row_uuid = turn.user_msg.get("uuid")
         if not isinstance(user_row_uuid, str) or not user_row_uuid:
             continue
         if user_row_uuid not in session_state.turn_numbers:
-            session_state.turn_numbers[user_row_uuid] = len(session_state.turn_numbers) + 1
+            session_state.turn_numbers[user_row_uuid] = next_turn_number
+            next_turn_number += 1
 
 
 def get_new_turns_from_transcript(
