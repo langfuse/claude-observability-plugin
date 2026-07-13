@@ -1150,6 +1150,7 @@ def _get_latest_timestamp(*timestamps: Optional[datetime]) -> Optional[datetime]
 def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
                      start_time: Optional[datetime],
                      parent_otel_span: Any = None,
+                     as_root: bool = False,
                      **obs_kwargs: Any) -> Any:
     """Create a Langfuse observation with an explicit OTel start_time.
 
@@ -1178,6 +1179,11 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
             otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
     else:
         otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+    if as_root:
+        # SDK/server contract: spans under a synthetic trace-id carrier have a
+        # parentSpanId that never exports, so the server only treats them as
+        # the trace root (deriving trace input/output/name) with this marker.
+        otel_span.set_attribute("langfuse.internal.as_root", True)
     return langfuse._create_observation_from_otel_span(
         otel_span=otel_span,
         as_type=as_type,
@@ -1841,6 +1847,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         as_type="span",
         start_time=parse_timestamp(turn.user_msg),
         parent_otel_span=deterministic_trace_parent(langfuse, session_id, turn),
+        as_root=True,
         input={"role": "user", "content": user_text},
         metadata=trace_metadata,
     )

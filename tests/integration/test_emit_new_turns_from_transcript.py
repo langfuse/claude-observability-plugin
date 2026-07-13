@@ -77,3 +77,27 @@ def test_emit_new_turns_defers_async_agent_until_session_end_flush(
     state = json.loads((isolated_hook_state / "langfuse_state.json").read_text(encoding="utf-8"))
     assert next(iter(state.values()))["turn_count"] == 1
     assert next(iter(state.values()))["pending_agent_turns"] == []
+
+
+def test_only_the_turn_root_span_is_marked_as_root(
+    hook_module,
+    fixture_transcript_path,
+    fake_langfuse,
+    isolated_hook_state,
+):
+    # The root span sits under a synthetic trace-id carrier, so its exported
+    # parentSpanId never resolves; without the as_root marker the server
+    # creates only a shallow trace and drops trace-level input/output.
+    transcript = fixture_transcript_path("tool_turn")
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-as-root", transcript)
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config, "session-as-root", transcript, flush_deferred_agent_turns=True
+    )
+
+    roots = [o for o in fake_langfuse.observations if o.name == "Conversational Turn"]
+    children = [o for o in fake_langfuse.observations if o.name != "Conversational Turn"]
+    assert roots and children
+    assert all(o._otel_span.attributes.get("langfuse.internal.as_root") is True for o in roots)
+    assert all("langfuse.internal.as_root" not in o._otel_span.attributes for o in children)

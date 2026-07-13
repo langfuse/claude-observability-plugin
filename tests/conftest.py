@@ -76,6 +76,10 @@ class FakeOtelSpan:
     def __init__(self, name: str, start_time: int | None) -> None:
         self.name = name
         self.start_time = start_time
+        self.attributes: dict[str, Any] = {}
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
 
 
 class FakeTracer:
