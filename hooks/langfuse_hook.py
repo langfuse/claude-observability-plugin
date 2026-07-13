@@ -1817,48 +1817,66 @@ def deterministic_trace_parent(langfuse: Langfuse, session_id: str, turn: Turn) 
         return None
 
 
+def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
+                        transcript_path: Path) -> Any:
+    """Open the turn's root span, backdated to the user message.
+
+    Kept separate from observe/close so incremental emission can run the
+    phases in different hook invocations: the root span opens on the first
+    firing that sees the turn and closes only when the turn does.
+    """
+    user_text_raw = extract_text_from_content(get_content_from_row(turn.user_msg))
+    user_text, user_text_meta = truncate_text(user_text_raw)
+    trace_metadata = build_trace_metadata(session_id, turn_num, turn, transcript_path, user_text_meta)
+    return _start_backdated(
+        langfuse,
+        name="Conversational Turn",
+        as_type="span",
+        start_time=parse_timestamp(turn.user_msg),
+        parent_otel_span=deterministic_trace_parent(langfuse, session_id, turn),
+        input={"role": "user", "content": user_text},
+        metadata=trace_metadata,
+    )
+
+
+def observe_turn(langfuse: Langfuse, trace_span: Any, turn: Turn,
+                 subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]]) -> Optional[datetime]:
+    """Emit the turn's generations and tool observations under its root span."""
+    return emit_turn_observations(
+        langfuse,
+        trace_span._otel_span,
+        turn,
+        parse_timestamp(turn.user_msg),
+        subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+    )
+
+
+def close_turn_root_span(trace_span: Any, turn: Turn, obs_end_ts: Optional[datetime]) -> None:
+    """Close the turn's root span with its final output and end time."""
+    last_assistant = turn.assistant_msgs[-1]
+    final_assistant_text, _ = truncate_text(extract_text_from_content(get_content_from_row(last_assistant)))
+    trace_span.update(output={"role": "assistant", "content": final_assistant_text})
+    end_ts = _get_latest_timestamp(
+        get_turn_end_timestamp(turn),
+        parse_timestamp(last_assistant),
+        obs_end_ts,
+        parse_timestamp(turn.user_msg),
+    )
+    trace_span.end(end_time=to_otel_nanoseconds(end_ts))
+
+
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
               user_id: Optional[str] = None,
               subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
-    user_text_raw = extract_text_from_content(get_content_from_row(turn.user_msg))
-    user_text, user_text_meta = truncate_text(user_text_raw)
-
-    last_assistant = turn.assistant_msgs[-1]
-    final_assistant_text, _ = truncate_text(extract_text_from_content(get_content_from_row(last_assistant)))
-
-    user_ts = parse_timestamp(turn.user_msg)
-    last_assistant_ts = parse_timestamp(last_assistant)
-    turn_end_ts = get_turn_end_timestamp(turn)
-    trace_metadata = build_trace_metadata(session_id, turn_num, turn, transcript_path, user_text_meta)
-    tags = get_trace_tags(turn)
-
-    trace_name = trace_display_name(session_id, turn_num)
-    root_observation_name = "Conversational Turn"
-
     with propagate_attributes(
         session_id=session_id,
         user_id=user_id,
-        trace_name=trace_name,
-        tags=tags,
+        trace_name=trace_display_name(session_id, turn_num),
+        tags=get_trace_tags(turn),
     ):
-        trace_span = _start_backdated(
-            langfuse,
-            name=root_observation_name,
-            as_type="span",
-            start_time=user_ts,
-            parent_otel_span=deterministic_trace_parent(langfuse, session_id, turn),
-            input={"role": "user", "content": user_text},
-            metadata=trace_metadata,
-        )
-        obs_end_ts = emit_turn_observations(
-            langfuse,
-            trace_span._otel_span,
-            turn,
-            user_ts,
-            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
-        )
-        trace_span.update(output={"role": "assistant", "content": final_assistant_text})
-        trace_span.end(end_time=to_otel_nanoseconds(_get_latest_timestamp(turn_end_ts, last_assistant_ts, obs_end_ts, user_ts)))
+        trace_span = open_turn_root_span(langfuse, session_id, turn_num, turn, transcript_path)
+        obs_end_ts = observe_turn(langfuse, trace_span, turn, subagent_transcripts_by_tool_use_id)
+        close_turn_root_span(trace_span, turn, obs_end_ts)
 
 
 # ---- New turn emission orchestration ----
