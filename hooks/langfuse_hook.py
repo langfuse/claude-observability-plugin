@@ -276,6 +276,9 @@ class SessionState:
     # within one logical turn (task notifications, blocking hooks), so the
     # trailing turn stays open until a new user row or SessionEnd closes it.
     open_turn_rows: List[Dict[str, Any]] = field(default_factory=list)
+    # Turn numbers assigned when a turn is first seen (keyed by its user-row
+    # uuid), so a turn keeps its number regardless of when it is emitted.
+    turn_numbers: Dict[str, int] = field(default_factory=dict)
 
 def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
@@ -288,6 +291,9 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     open_turn_rows = s.get("open_turn_rows")
     if not isinstance(open_turn_rows, list):
         open_turn_rows = []
+    turn_numbers = s.get("turn_numbers")
+    if not isinstance(turn_numbers, dict):
+        turn_numbers = {}
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
@@ -295,6 +301,7 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
         pending_agent_turns=pending_agent_turns,
         pending_task_notifications=pending_task_notifications,
         open_turn_rows=open_turn_rows,
+        turn_numbers=turn_numbers,
     )
 
 def update_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
@@ -305,6 +312,7 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "pending_agent_turns": session_state.pending_agent_turns or [],
         "pending_task_notifications": session_state.pending_task_notifications or [],
         "open_turn_rows": session_state.open_turn_rows or [],
+        "turn_numbers": session_state.turn_numbers or {},
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -475,6 +483,7 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
             session_state.pending_agent_turns = []
             session_state.pending_task_notifications = []
             session_state.open_turn_rows = []
+            session_state.turn_numbers = {}
         with open(transcript_path, "rb") as f:
             f.seek(session_state.offset)
             chunk = f.read()
@@ -982,6 +991,19 @@ def build_turns(
     return turns
 
 
+def assign_turn_numbers(turns: List[Turn], trailing_turn: Optional[Turn],
+                        session_state: SessionState) -> None:
+    """Assigns each turn its number the first time it is seen (in transcript
+    order). Keyed by the turn's user-row uuid."""
+    trailing = [trailing_turn] if trailing_turn is not None else []
+    for turn in turns + trailing:
+        user_row_uuid = turn.user_msg.get("uuid")
+        if not isinstance(user_row_uuid, str) or not user_row_uuid:
+            continue
+        if user_row_uuid not in session_state.turn_numbers:
+            session_state.turn_numbers[user_row_uuid] = len(session_state.turn_numbers) + 1
+
+
 def get_new_turns_from_transcript(
     transcript_path: Path,
     session_state: SessionState,
@@ -1036,6 +1058,7 @@ def get_new_turns_from_transcript(
         if trailing_turn_rows:
             debug(f"Holding trailing open turn ({len(trailing_turn_rows)} row(s)) until a new user row closes it")
 
+    assign_turn_numbers(turns, trailing_turn, session_state)
     return turns, session_state
 
 def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
@@ -1833,7 +1856,9 @@ def emit_ready_turns(
     emitted = 0
     for turn in turns_to_emit:
         emitted += 1
-        turn_num = session_state.turn_count + emitted
+        turn_num = session_state.turn_numbers.get(
+            turn.user_msg.get("uuid"), session_state.turn_count + emitted
+        )
         try:
             emit_turn(
                 langfuse,
