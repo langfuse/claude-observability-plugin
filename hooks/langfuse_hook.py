@@ -74,6 +74,22 @@ def get_langfuse_config() -> Optional[LangfuseConfig]:
         trace_seed=trace_seed,
     )
 
+def _missing_langfuse_keys() -> List[str]:
+    missing = []
+    if not (_opt("LANGFUSE_PUBLIC_KEY") or _opt("CC_LANGFUSE_PUBLIC_KEY")):
+        missing.append("LANGFUSE_PUBLIC_KEY")
+    if not (_opt("LANGFUSE_SECRET_KEY") or _opt("CC_LANGFUSE_SECRET_KEY")):
+        missing.append("LANGFUSE_SECRET_KEY")
+    return missing
+
+def log_missing_langfuse_config() -> None:
+    missing = ", ".join(_missing_langfuse_keys()) or "unknown keys"
+    info(
+        f"Langfuse config incomplete: missing {missing} "
+        "(checked CLAUDE_PLUGIN_OPTION_* and plain env vars); tracing disabled for this turn. "
+    )
+
+
 # ----------------- Logging -----------------
 _logger: Optional[logging.Logger] = None
 
@@ -137,7 +153,8 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
             secret_key=config.secret_key,
             host=config.host,
         )
-    except Exception:
+    except Exception as e:
+        info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
         return None
 
 
@@ -1974,6 +1991,7 @@ def main() -> int:
 
     config = get_langfuse_config()
     if config is None:
+        log_missing_langfuse_config()
         return 0
 
     payload = read_hook_payload()
