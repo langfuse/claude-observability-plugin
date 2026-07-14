@@ -82,6 +82,10 @@ def hook_module() -> Any:
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # Tests exercise langfuse/otel internals directly (module.Langfuse, etc.), so
+    # force the otherwise-lazy import now. Stubs are already in sys.modules above,
+    # so this is instant — it doesn't reintroduce the real import cost being fixed.
+    assert module._ensure_langfuse_imported()
     return module
 
 

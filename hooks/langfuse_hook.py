@@ -9,6 +9,7 @@
 Claude Code -> Langfuse hook
 
 """
+from __future__ import annotations
 
 import json
 import logging
@@ -25,12 +26,29 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# ----------------- Langfuse import (fail-open) -----------------
-try:
-    from langfuse import Langfuse, propagate_attributes
-    from opentelemetry import trace as otel_trace_api
-except Exception:
-    sys.exit(0)
+# ----------------- Langfuse import (fail-open, lazy) -----------------
+# Importing langfuse/opentelemetry pulls in a real dependency resolution +
+# module graph (measured ~2.4s with a warm uv cache). SessionEnd hooks are
+# killed by the CLI shutdown deadline before that finishes, and the common
+# SessionEnd run has nothing new to emit anyway (Stop already covered it).
+# So the import is deferred until main() has confirmed there is actual work.
+Langfuse = None
+propagate_attributes = None
+otel_trace_api = None
+
+def _ensure_langfuse_imported() -> bool:
+    global Langfuse, propagate_attributes, otel_trace_api
+    if Langfuse is not None:
+        return True
+    try:
+        from langfuse import Langfuse as _Langfuse, propagate_attributes as _propagate_attributes
+        from opentelemetry import trace as _otel_trace_api
+    except Exception:
+        return False
+    Langfuse = _Langfuse
+    propagate_attributes = _propagate_attributes
+    otel_trace_api = _otel_trace_api
+    return True
 
 
 # ----------------- Paths -----------------
@@ -83,6 +101,8 @@ def get_langfuse_config() -> Optional[LangfuseConfig]:
     )
 
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
+    if not _ensure_langfuse_imported():
+        return None
     try:
         return Langfuse(
             public_key=config.public_key,
@@ -1962,6 +1982,28 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
 
 
 # ----------------- Main -----------------
+def _has_pending_work(session_id: str, transcript_path: Path) -> bool:
+    """Cheap check (no langfuse import, no lock) for whether this run has anything to emit.
+
+    Covers the common SessionEnd case: Stop already uploaded everything, so the
+    transcript has no bytes past the saved offset and nothing is deferred.
+    """
+    try:
+        offset = 0
+        pending = True
+        state = load_hook_state()
+        key = get_session_state_key(session_id, str(transcript_path))
+        entry = state.get(key)
+        if isinstance(entry, dict):
+            offset = int(entry.get("offset", 0))
+            pending = bool(entry.get("pending_agent_turns")) or bool(entry.get("pending_task_notifications"))
+        file_size = transcript_path.stat().st_size if transcript_path.exists() else 0
+        return pending or file_size != offset
+    except Exception:
+        # Fail open: if the cheap check itself breaks, fall through to the real path.
+        return True
+
+
 def main() -> int:
     start = time.time()
     debug("Hook started")
@@ -1977,6 +2019,10 @@ def main() -> int:
 
     session_id, transcript_path = hook_context
     flush_deferred_agent_turns = is_session_end_hook_payload(payload)
+
+    if not _has_pending_work(session_id, transcript_path):
+        debug("Nothing new to emit, skipping langfuse import")
+        return 0
 
     langfuse = create_langfuse_client(config)
     if langfuse is None:
