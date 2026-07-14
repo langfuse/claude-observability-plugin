@@ -25,14 +25,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# ----------------- Langfuse import (fail-open) -----------------
-try:
-    from langfuse import Langfuse, propagate_attributes
-    from opentelemetry import trace as otel_trace_api
-except Exception:
-    sys.exit(0)
-
-
 # ----------------- Paths -----------------
 STATE_DIR = Path.home() / ".claude" / "state"
 LOG_FILE = STATE_DIR / "langfuse_hook.log"
@@ -82,17 +74,6 @@ def get_langfuse_config() -> Optional[LangfuseConfig]:
         trace_seed=trace_seed,
     )
 
-def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
-    try:
-        return Langfuse(
-            public_key=config.public_key,
-            secret_key=config.secret_key,
-            host=config.host,
-        )
-    except Exception:
-        return None
-
-
 # ----------------- Logging -----------------
 _logger: Optional[logging.Logger] = None
 
@@ -133,6 +114,31 @@ def info(msg: str) -> None:
             lg.info(msg)
         except Exception:
             pass
+
+
+# ----------------- Langfuse import (fail-open) -----------------
+# Everything above this guard runs before the SDK import and must stay
+# stdlib-only and parseable on Python 3.9 so this failure path can log.
+try:
+    from langfuse import Langfuse, propagate_attributes
+    from opentelemetry import trace as otel_trace_api
+except Exception as e:
+    info(
+        f"langfuse import failed ({type(e).__name__}: {e}); "
+        f"python={sys.version.split()[0]} executable={sys.executable} "
+        f"PATH={os.environ.get('PATH', '')}"
+    )
+    sys.exit(0)
+
+def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
+    try:
+        return Langfuse(
+            public_key=config.public_key,
+            secret_key=config.secret_key,
+            host=config.host,
+        )
+    except Exception:
+        return None
 
 
 # ----------------- Hook payload -----------------
