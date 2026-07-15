@@ -82,12 +82,26 @@ def _missing_langfuse_keys() -> List[str]:
         missing.append("LANGFUSE_SECRET_KEY")
     return missing
 
+def _plugin_load_identity() -> str:
+    # CLAUDE_PLUGIN_DATA ends in "<plugin-name>-<identity>", so the identity this
+    # hook was loaded under is directly observable; empty when undeterminable.
+    base = Path(os.environ.get("CLAUDE_PLUGIN_DATA", "")).name
+    prefix = "langfuse-observability-"
+    return base[len(prefix):] if base.startswith(prefix) else ""
+
 def log_missing_langfuse_config() -> None:
     missing = ", ".join(_missing_langfuse_keys()) or "unknown keys"
-    info(
+    msg = (
         f"Langfuse config incomplete: missing {missing} "
-        "(checked CLAUDE_PLUGIN_OPTION_* and plain env vars); tracing disabled for this turn. "
+        "(checked CLAUDE_PLUGIN_OPTION_* and plain env vars); tracing disabled for this turn."
     )
+    identity = _plugin_load_identity()
+    if identity and identity != "langfuse-observability":
+        msg += (
+            f" Note: this hook was loaded under plugin identity '@{identity}'; options configured "
+            "under '@langfuse-observability' are not delivered to it."
+        )
+    info(msg)
 
 
 # ----------------- Logging -----------------

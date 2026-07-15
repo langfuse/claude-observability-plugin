@@ -13,12 +13,15 @@ KEY_NAMES = [
     "CC_LANGFUSE_SECRET_KEY",
 ]
 
+IDENTITY_NOTE_MARKER = "loaded under plugin identity"
+
 
 @pytest.fixture
 def clean_key_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in KEY_NAMES:
         monkeypatch.delenv(name, raising=False)
         monkeypatch.delenv(f"CLAUDE_PLUGIN_OPTION_{name}", raising=False)
+    monkeypatch.delenv("CLAUDE_PLUGIN_DATA", raising=False)
 
 
 def _read_log(hook_module: Any) -> str:
@@ -29,6 +32,7 @@ def test_missing_keys_are_logged_at_info(hook_module: Any, clean_key_env: None) 
     hook_module.log_missing_langfuse_config()
 
     log = _read_log(hook_module)
+    assert "[INFO]" in log
     assert "Langfuse config incomplete" in log
     assert "LANGFUSE_PUBLIC_KEY" in log
     assert "LANGFUSE_SECRET_KEY" in log
@@ -43,6 +47,72 @@ def test_partial_keys_name_only_the_missing_one(
 
     log = _read_log(hook_module)
     assert "missing LANGFUSE_SECRET_KEY (" in log
+
+
+def test_inline_identity_gets_identity_note(
+    hook_module: Any, clean_key_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "CLAUDE_PLUGIN_DATA", "/home/user/.claude/plugins/data/langfuse-observability-inline"
+    )
+
+    hook_module.log_missing_langfuse_config()
+
+    log = _read_log(hook_module)
+    assert f"{IDENTITY_NOTE_MARKER} '@inline'" in log
+    assert "are not delivered to it" in log
+    assert "LANGFUSE_SECRET_KEY" in log
+
+
+def test_inline_identity_note_survives_trailing_slash(
+    hook_module: Any, clean_key_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "CLAUDE_PLUGIN_DATA", "/home/user/.claude/plugins/data/langfuse-observability-inline/"
+    )
+
+    hook_module.log_missing_langfuse_config()
+
+    log = _read_log(hook_module)
+    assert f"{IDENTITY_NOTE_MARKER} '@inline'" in log
+
+
+def test_installed_identity_gets_no_identity_note(
+    hook_module: Any, clean_key_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "CLAUDE_PLUGIN_DATA",
+        "/home/user/.claude/plugins/data/langfuse-observability-langfuse-observability",
+    )
+
+    hook_module.log_missing_langfuse_config()
+
+    log = _read_log(hook_module)
+    assert "Langfuse config incomplete" in log
+    assert IDENTITY_NOTE_MARKER not in log
+
+
+@pytest.mark.parametrize(
+    "data_value",
+    [
+        None,
+        "/home/user/.claude/plugins/data/langfuse-observability",
+        "/home/user/.claude/plugins/data/some-other-plugin-inline",
+    ],
+)
+def test_unknown_identity_source_gets_no_identity_note(
+    hook_module: Any, clean_key_env: None, monkeypatch: pytest.MonkeyPatch, data_value: str | None
+) -> None:
+    if data_value is None:
+        monkeypatch.delenv("CLAUDE_PLUGIN_DATA", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_PLUGIN_DATA", data_value)
+
+    hook_module.log_missing_langfuse_config()
+
+    log = _read_log(hook_module)
+    assert "Langfuse config incomplete" in log
+    assert IDENTITY_NOTE_MARKER not in log
 
 
 def test_client_creation_failure_is_logged(hook_module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
