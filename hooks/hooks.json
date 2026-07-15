@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if command -v uv >/dev/null 2>&1; then exec uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; else exec python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; fi"
+            "command": "export PATH=\"$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin\"; if command -v uv >/dev/null 2>&1; then exec uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; else exec python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; fi"
           }
         ]
       }
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if command -v uv >/dev/null 2>&1; then exec uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; else exec python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; fi"
+            "command": "export PATH=\"$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin\"; if command -v uv >/dev/null 2>&1; then exec uv run --quiet --script \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; else exec python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/langfuse_hook.py; fi"
           }
         ]
       }
