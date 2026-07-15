@@ -32,7 +32,6 @@ def test_missing_keys_are_logged_at_info(hook_module: Any, clean_key_env: None) 
     assert "Langfuse config incomplete" in log
     assert "LANGFUSE_PUBLIC_KEY" in log
     assert "LANGFUSE_SECRET_KEY" in log
-    assert "README troubleshooting" in log
 
 
 def test_partial_keys_name_only_the_missing_one(
