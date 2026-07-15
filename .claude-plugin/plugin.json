@@ -61,6 +61,28 @@
       "type": "string",
       "title": "Trace ID seed",
       "description": "Optional. Derive deterministic trace ids as Langfuse.create_trace_id(seed=f\"{seed}:{turn_number}\") so external systems can precompute them. Use a unique seed per session (e.g. the --session-id UUID). Leave empty for auto-generated ids."
+    },
+    "CC_LANGFUSE_TAG_COMMAND": {
+      "type": "string",
+      "title": "Custom tag command",
+      "description": "Optional shell command run once per hook run; each non-empty line of its stdout is added to the trace tags. Use it to attribute traces to a git branch, ticket id, CI run, or cost center without editing the hook. Fail-open and bounded (see CC_LANGFUSE_TAG_TIMEOUT; max 20 tags of 64 chars). Example: a script that echoes 'sc-1234' derived from the current branch."
+    },
+    "CC_LANGFUSE_TAG_TIMEOUT": {
+      "type": "number",
+      "title": "Custom tag command timeout (seconds)",
+      "description": "Timeout for CC_LANGFUSE_TAG_COMMAND and CC_LANGFUSE_SESSION_LABEL_COMMAND. Default 2. If a command runs longer it is killed and contributes nothing.",
+      "default": 2
+    },
+    "CC_LANGFUSE_SESSION_LABEL_COMMAND": {
+      "type": "string",
+      "title": "Session label command",
+      "description": "Optional shell command whose first non-empty stdout line becomes a label used to group this session's traces in Langfuse (e.g. a ticket id from the branch). The same script can serve CC_LANGFUSE_TAG_COMMAND (tags use every line, the label uses the first). Fail-open and bounded."
+    },
+    "CC_LANGFUSE_SESSION_LABEL_MODE": {
+      "type": "string",
+      "title": "Session label mode",
+      "description": "How the label groups sessions. 'prefix' (default): session id becomes '<label>/<session>', one Langfuse session per Claude session grouped under the label. 'collapse': every session sharing a label merges into one. 'off': disable. Affects only trace grouping; incremental read state stays keyed on the raw session id.",
+      "default": "prefix"
     }
   }
 }
