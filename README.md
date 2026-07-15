@@ -200,7 +200,7 @@ GUI apps do not read your shell profile. `export`ed variables in `~/.zshrc` neve
 
 Recent Claude Desktop builds load user-installed plugins under a different plugin identity (`langfuse-observability@inline`), so keys configured via `/plugin configure` are not delivered to the hook. Terminal sessions work, desktop sessions stay silent. When this happens, the log line contains `loaded under plugin identity '@inline'`.
 
-As a **temporary workaround** until the upstream Claude Code fix lands, duplicate your full options under the inline identity in `~/.claude/settings.json`:
+As a **temporary workaround**, duplicate your full options under the inline identity in `~/.claude/settings.json`:
 
 ```json
 "pluginConfigs": {
@@ -214,7 +214,7 @@ As a **temporary workaround** until the upstream Claude Code fix lands, duplicat
 }
 ```
 
-The entry must include `LANGFUSE_SECRET_KEY` because the OS-keychain secret only applies to the installed identity. This stores the secret in plaintext, so consider a dedicated API key pair for the workaround period and remove the entry once the upstream fix ships. No restart is needed; settings are picked up on the next message.
+The entry must include `LANGFUSE_SECRET_KEY` because the OS-keychain secret only applies to the installed identity. This stores the secret in plaintext, so consider a dedicated API key pair for the workaround period and remove the entry once it is no longer needed. No restart is needed; settings are picked up on the next message.
 
 ## License
 
