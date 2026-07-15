@@ -13,10 +13,11 @@ The marketplace command registers the plugin marketplace and refreshes its local
 
 Restart Claude Code after install so the hook configuration is loaded.
 
-Then configure the plugin from within a Claude Code session. This is a Claude Code slash command, not a shell command:
+Then configure the plugin from within a Claude Code session. This is a Claude Code slash command, not a shell command. Run `claude` first, then type it at the session prompt:
 
 ```text
-/plugin configure langfuse-observability@langfuse-observability
+$ claude
+> /plugin configure langfuse-observability@langfuse-observability
 ```
 
 Alternatively, pass configuration values during install:
@@ -48,10 +49,16 @@ Get keys from your Langfuse project settings → API Keys.
 
 One of:
 
-- [uv](https://docs.astral.sh/uv/) (recommended) on `PATH`. The hook uses `uv run --script` and installs the Langfuse SDK from the script metadata automatically.
+- [uv](https://docs.astral.sh/uv/) (recommended) on `PATH`. The hook uses `uv run --script` and installs the Langfuse SDK from the script metadata automatically. In addition to your `PATH`, the hook also looks in the standard install locations `~/.local/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`.
 - Python 3.10+ as `python3` with `langfuse>=4.0,<5` installed in that Python environment. This is only used as a fallback when `uv` is not on `PATH`.
 
-If neither is set up, the hook exits silently — no impact on Claude Code.
+On the first hook run, uv downloads the Langfuse SDK from PyPI (declared in the script header) and caches it. Offline or proxied machines fail this download and retry on every turn until the cache is warm; you can pre-warm it from a networked terminal:
+
+```bash
+echo '{}' | uv run --quiet --script <plugin-root>/hooks/langfuse_hook.py
+```
+
+If no usable runtime is set up, the hook exits without tracing, and Claude Code is never blocked or slowed. Failure reasons are written to `~/.claude/state/langfuse_hook.log` (see Troubleshooting).
 
 ## How it works
 
@@ -173,10 +180,41 @@ claude plugin uninstall langfuse-observability
 
 ## Troubleshooting
 
-- Nothing in Langfuse: check `~/.claude/state/langfuse_hook.log` (enable `CC_LANGFUSE_DEBUG`).
-- Desktop chat has no traces: regular Claude Desktop Chat mode is not hook-backed. Use the `claude` CLI or Claude Code GUI Code mode.
-- Hook not firing: confirm with `claude plugin list` that langfuse-observability is enabled; restart Claude Code.
-- langfuse import errors (no uv): install uv, or ensure the `python3` on your PATH is Python 3.10+ and has `langfuse>=4.0,<5` installed.
+Nearly every failure explains itself in `~/.claude/state/langfuse_hook.log`. Send one message, then match the newest lines against this table:
+
+| What the log shows | Meaning | What to do |
+| --- | --- | --- |
+| No new lines at all | The hook never launched. Either the plugin is disabled, no usable runtime was found (no `uv`, no suitable `python3`), or uv could not download the SDK (offline/proxy) | Run `claude plugin list` **from the directory you use in the app**, since enable/disable can be project-scoped. Install uv in a standard location. Pre-warm the SDK download (see Requirements) |
+| `langfuse import failed (…) python=… PATH=…` | The Python that ran the hook cannot import the SDK; the line names the interpreter, version, and PATH | Install uv in a standard location, or make sure `python3` is 3.10+ with `langfuse>=4.0,<5` installed |
+| `Langfuse config incomplete: missing …` | The named key(s) did not reach the hook. Either not configured yet, or configured but not delivered | Configure via `/plugin configure`. If the line also says `loaded under plugin identity '@inline'`, see the desktop section below |
+| `Hook started` plus a skip reason (e.g. `Transcript path does not exist`) | The hook ran and skipped intentionally; these often come from background/utility sessions | Usually harmless. File an issue with the log line if actual turns are missing |
+| `Processed N turns …` but nothing in Langfuse | Turns were handed to the SDK but delivery failed afterwards; export errors go to stderr, not this log | Check `LANGFUSE_BASE_URL` (EU `https://cloud.langfuse.com` vs US `https://us.cloud.langfuse.com`), key validity, and network/proxy reachability |
+
+`Hook started` and other `[DEBUG]` lines require debug logging (`CC_LANGFUSE_DEBUG=true` via `/plugin configure`); the failure lines above are written at `[INFO]` and appear without it. Regular Claude Desktop **Chat** mode is not hook-backed. Tracing covers the `claude` CLI and desktop **Code** mode.
+
+### Desktop app (GUI) sessions
+
+GUI apps do not read your shell profile. `export`ed variables in `~/.zshrc` never reach GUI-spawned hooks, and the app resolves its `PATH` once at launch. After installing uv, fully quit and relaunch the desktop app. Keys must be configured via `/plugin configure` (or `--config` at install), not via shell exports.
+
+### Plugin options not delivered in GUI sessions
+
+Recent Claude Desktop builds load user-installed plugins under a different plugin identity (`langfuse-observability@inline`), so keys configured via `/plugin configure` are not delivered to the hook. Terminal sessions work, desktop sessions stay silent. When this happens, the log line contains `loaded under plugin identity '@inline'`.
+
+As a **temporary workaround** until the upstream Claude Code fix lands, duplicate your full options under the inline identity in `~/.claude/settings.json`:
+
+```json
+"pluginConfigs": {
+  "langfuse-observability@inline": {
+    "options": {
+      "LANGFUSE_PUBLIC_KEY": "pk-lf-...",
+      "LANGFUSE_SECRET_KEY": "sk-lf-...",
+      "LANGFUSE_BASE_URL": "https://cloud.langfuse.com"
+    }
+  }
+}
+```
+
+The entry must include `LANGFUSE_SECRET_KEY` because the OS-keychain secret only applies to the installed identity. This stores the secret in plaintext, so consider a dedicated API key pair for the workaround period and remove the entry once the upstream fix ships. No restart is needed; settings are picked up on the next message.
 
 ## License
 
