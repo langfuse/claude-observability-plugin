@@ -2066,53 +2066,106 @@ def post_ingestion_events(config: LangfuseConfig, events: List[Dict[str, Any]]) 
         info(f"ingestion update failed ({len(events)} event(s)): {type(e).__name__}: {e}")
 
 
-def observe_turn(langfuse: Langfuse, trace_span: Any, turn: Turn,
-                 subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]]) -> Optional[datetime]:
-    """Emit the turn's generations and tool observations under its root span."""
-    return emit_turn_observations(
-        langfuse,
-        trace_span._otel_span,
-        turn,
-        parse_timestamp(turn.user_msg),
-        subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
-    )
-
-
-def close_turn_root_span(trace_span: Any, turn: Turn, obs_end_ts: Optional[datetime]) -> None:
-    """Close the turn's root span with its final output and end time."""
+def build_turn_output_payload(turn: Turn) -> Dict[str, Any]:
     last_assistant = turn.assistant_msgs[-1]
-    final_assistant_text, _ = truncate_text(extract_text_from_content(get_content_from_row(last_assistant)))
-    trace_span.update(output={"role": "assistant", "content": final_assistant_text})
-    end_ts = _get_latest_timestamp(
+    text, _ = truncate_text(extract_text_from_content(get_content_from_row(last_assistant)))
+    return {"role": "assistant", "content": text}
+
+
+def get_root_span_end_time(turn: Turn, obs_end_ts: Optional[datetime]) -> Optional[datetime]:
+    return _get_latest_timestamp(
         get_turn_end_timestamp(turn),
-        parse_timestamp(last_assistant),
+        parse_timestamp(turn.assistant_msgs[-1]),
         obs_end_ts,
         parse_timestamp(turn.user_msg),
     )
-    trace_span.end(end_time=to_otel_nanoseconds(end_ts))
 
 
-def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
+def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
+              turn: Turn, transcript_path: Path,
+              update_sink: List[Dict[str, Any]],
               user_id: Optional[str] = None,
-              subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+              subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+              progress: Optional[Dict[str, Any]] = None,
+              close: bool = True) -> Dict[str, Any]:
+    """Emit a turn, resuming from prior firings' progress.
+
+    With no progress and close=True this is the classic one-shot emission.
+    With close=False only ready observations ship (those whose emitted form
+    can no longer change) and the root span is ended provisionally; a later
+    firing resumes from the returned progress (root span id + emitted keys)
+    and corrects the root via span-update.
+    """
+    progress = dict(progress or {})
+    cursor = EmissionCursor(
+        emitted=set(k for k in (progress.get("emitted_keys") or []) if isinstance(k, str)),
+        completed_only=not close,
+    )
     with propagate_attributes(
         session_id=session_id,
         user_id=user_id,
         trace_name=trace_display_name(session_id, turn_num),
         tags=get_trace_tags(turn),
     ):
-        trace_span = open_turn_root_span(langfuse, session_id, turn_num, turn, transcript_path)
-        obs_end_ts = observe_turn(langfuse, trace_span, turn, subagent_transcripts_by_tool_use_id)
-        close_turn_root_span(trace_span, turn, obs_end_ts)
+        trace_span = None
+        root_span_id = progress.get("root_span_id")
+        if not is_valid_span_id_hex(root_span_id):
+            trace_span = open_turn_root_span(langfuse, session_id, turn_num, turn, transcript_path)
+            root_span_id = getattr(trace_span, "id", None)
+            progress["root_span_id"] = root_span_id
+            progress["trace_id"] = getattr(trace_span, "trace_id", None)
+            parent_otel_span = trace_span._otel_span
+        else:
+            # Root span exported by an earlier firing: attach children to it
+            # via a carrier and correct the root itself via span-update.
+            parent_otel_span = remote_parent(
+                langfuse, session_id, turn.user_msg.get("uuid"), root_span_id=root_span_id
+            )
+        obs_end_ts = emit_turn_observations(
+            langfuse,
+            parent_otel_span,
+            turn,
+            parse_timestamp(turn.user_msg),
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            cursor=cursor,
+        )
+        end_ts = get_root_span_end_time(turn, obs_end_ts)
+        output = build_turn_output_payload(turn)
+        if trace_span is not None:
+            # OTel only exports ended spans, so the root closes now either
+            # way; a non-closing turn gets its final output/end via a later
+            # firing's span-update.
+            trace_span.update(output=output)
+            trace_span.end(end_time=to_otel_nanoseconds(end_ts))
+        elif close or cursor.newly_emitted:
+            # Idle firings send no root update: every update creates a row
+            # version on the server, visible as a transient duplicate root
+            # in the events view until ClickHouse merges the versions.
+            user_text, user_text_meta = truncate_text(
+                extract_text_from_content(get_content_from_row(turn.user_msg))
+            )
+            queue_root_span_update(
+                update_sink, progress.get("trace_id"), root_span_id,
+                start_time=parse_timestamp(turn.user_msg),
+                end_time=end_ts,
+                input_payload={"role": "user", "content": user_text},
+                output=output,
+                metadata=build_trace_metadata(
+                    session_id, turn_num, turn, transcript_path, user_text_meta
+                ),
+            )
+    progress["emitted_keys"] = sorted(cursor.emitted)
+    return progress
 
 
 # ---- New turn emission orchestration ----
-def emit_ready_turns(
+def emit_and_close_ready_turns(
     langfuse: Langfuse,
     session_id: str,
     transcript_path: Path,
     turns_to_emit: List[Turn],
     session_state: SessionState,
+    update_sink: List[Dict[str, Any]],
     *,
     user_id: Optional[str],
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
@@ -2137,14 +2190,18 @@ def emit_ready_turns(
                 turn_num,
                 turn,
                 transcript_path,
+                update_sink,
                 user_id=user_id,
                 subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                progress=None,
+                close=True,
             )
         except Exception as e:
             # Log at INFO so SDK incompatibilities (and other emit failures)
             # are visible without needing CC_LANGFUSE_DEBUG=true.
             info(f"emit_turn failed: {type(e).__name__}: {e}")
     return emitted
+
 
 def emit_new_turns_from_transcript(
     langfuse: Langfuse,
@@ -2154,6 +2211,9 @@ def emit_new_turns_from_transcript(
     *,
     flush_deferred_agent_turns: bool = False,
 ) -> int:
+    # Ingestion updates are only collected while the lock is held and POSTed
+    # afterwards: network latency must never block concurrent hook runs.
+    update_sink: List[Dict[str, Any]] = []
     with FileLock(LOCK_FILE):
         state = load_hook_state()
         key = get_session_state_key(session_id, str(transcript_path))
@@ -2178,19 +2238,22 @@ def emit_new_turns_from_transcript(
             session_state,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
         )
-        emitted = emit_ready_turns(
+        emitted = emit_and_close_ready_turns(
             langfuse,
             session_id,
             transcript_path,
             turns_to_emit,
             session_state,
+            update_sink,
             user_id=config.user_id,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
         )
 
         session_state.turn_count += emitted
         save_session_state(state, key, session_state)
-        return emitted
+
+    post_ingestion_events(config, update_sink)
+    return emitted
 
 
 def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
