@@ -278,6 +278,11 @@ class SessionState:
     # Turn numbers assigned when a turn is first seen (keyed by its user-row
     # uuid), so a turn keeps its number regardless of when it is emitted.
     turn_numbers: Dict[str, int] = field(default_factory=dict)
+    # Per-turn emission progress (keyed by user-row uuid): trace_id,
+    # root_span_id and the keys of already-emitted observations. Carries a
+    # partially emitted turn across firings and across the open -> closed ->
+    # deferred transitions; entries are dropped once the turn is finalized.
+    turn_progress: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
@@ -293,6 +298,9 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     turn_numbers = s.get("turn_numbers")
     if not isinstance(turn_numbers, dict):
         turn_numbers = {}
+    turn_progress = s.get("turn_progress")
+    if not isinstance(turn_progress, dict):
+        turn_progress = {}
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
@@ -301,6 +309,7 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
         pending_task_notifications=pending_task_notifications,
         open_turn=open_turn,
         turn_numbers=turn_numbers,
+        turn_progress=turn_progress,
     )
 
 def update_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
@@ -312,6 +321,7 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "pending_task_notifications": session_state.pending_task_notifications or [],
         "open_turn": session_state.open_turn or {},
         "turn_numbers": session_state.turn_numbers or {},
+        "turn_progress": session_state.turn_progress or {},
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -483,6 +493,9 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
             session_state.pending_task_notifications = []
             session_state.open_turn = {}
             session_state.turn_numbers = {}
+            # Known limitation: root spans of partially emitted turns stay
+            # provisionally closed in Langfuse when rotation drops their progress.
+            session_state.turn_progress = {}
         with open(transcript_path, "rb") as f:
             f.seek(session_state.offset)
             chunk = f.read()
@@ -992,8 +1005,9 @@ def build_turns(
 
 def build_open_turn(trailing_turn: Optional[Turn],
                     trailing_turn_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Package the trailing turn for the session state; emitted_keys and
-    root_span_id are the (yet unused) slots for the emission cursor."""
+    """Package the trailing turn for the session state. Emission progress is
+    NOT kept here: it lives in session_state.turn_progress (keyed by the
+    user-row uuid) so it survives the open -> closed -> deferred transitions."""
     if not trailing_turn_rows:
         return {}
     if trailing_turn is not None:
@@ -1003,8 +1017,6 @@ def build_open_turn(trailing_turn: Optional[Turn],
     return {
         "user_row_uuid": user_row_uuid,
         "rows": trailing_turn_rows,
-        "emitted_keys": [],
-        "root_span_id": None,
     }
 
 
