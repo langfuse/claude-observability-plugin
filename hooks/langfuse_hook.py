@@ -1345,6 +1345,40 @@ def build_tool_metadata(
         })
     return tool_metadata
 
+@dataclass
+class EmissionCursor:
+    """Tracks which of a turn's observations were already emitted (namespaced
+    keys: gen:/tool:/subagent:) so continuation firings only emit what is new.
+
+    completed_only skips observations whose emitted form could still change
+    (generation awaiting tool results, running async subagent); at turn close
+    the cursor runs with completed_only=False so everything remaining ships.
+    """
+    emitted: set
+    completed_only: bool = False
+    newly_emitted: List[str] = field(default_factory=list)
+
+    def should_emit(self, key: str, complete: bool = True) -> bool:
+        if key in self.emitted:
+            return False
+        if self.completed_only and not complete:
+            return False
+        self.emitted.add(key)
+        self.newly_emitted.append(key)
+        return True
+
+
+def fresh_cursor() -> EmissionCursor:
+    """Cursor for one-shot emission: nothing emitted yet, emit everything."""
+    return EmissionCursor(emitted=set(), completed_only=False)
+
+
+def generation_emission_key(assistant_index: int, assistant_message: Dict[str, Any]) -> str:
+    # message.id is the merge unit of assistant rows; the noid fallback is
+    # stable because turns are always rebuilt in transcript order.
+    return f"gen:{get_message_id(assistant_message) or f'noid:{assistant_index}'}"
+
+
 def emit_single_tool_observation(
     langfuse: Langfuse,
     parent_otel_span: Any,
@@ -1354,6 +1388,8 @@ def emit_single_tool_observation(
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
     pending_subagents: List[Dict[str, Any]],
     pending_async_tool_results: List[Dict[str, Any]],
+    cursor: EmissionCursor,
+    tool_key: str,
 ) -> EmittedSingleToolObservation:
     tool_use_id = str(tool_use.get("id") or "")
     tool_name = tool_use.get("name") or "unknown"
@@ -1377,16 +1413,20 @@ def emit_single_tool_observation(
     tool_metadata = build_tool_metadata(tool_name, tool_use_id, tool_input_meta, tool_result, subagent)
 
     tool_use_timestamp = parse_timestamp(turn.tool_use_timestamps_by_id.get(tool_use_id)) or assistant_timestamp
-    tool_span = _start_backdated(
-        langfuse,
-        name=f"Tool: {tool_name}",
-        as_type="tool",
-        start_time=tool_use_timestamp,
-        parent_otel_span=parent_otel_span,
-        input=tool_input,
-        metadata=tool_metadata,
-    )
-    tool_span.update(output=tool_output)
+    # A tool span's end time comes from its result row, so it only counts as
+    # complete once that row exists.
+    tool_span = None
+    if cursor.should_emit(tool_key, complete=tool_result_entry is not None):
+        tool_span = _start_backdated(
+            langfuse,
+            name=f"Tool: {tool_name}",
+            as_type="tool",
+            start_time=tool_use_timestamp,
+            parent_otel_span=parent_otel_span,
+            input=tool_input,
+            metadata=tool_metadata,
+        )
+        tool_span.update(output=tool_output)
 
     subagent_end_timestamp = None
     if subagent:
@@ -1398,12 +1438,24 @@ def emit_single_tool_observation(
                 "ready_timestamp": tool_result.final_result_timestamp,
             })
         else:
-            subagent_end_timestamp = emit_subagent_observations(
-                langfuse,
-                parent_otel_span,
-                subagent,
-                tool_use_timestamp,
+            # Without a final result the subagent may still be running: its
+            # transcript on disk is not authoritative yet. No tool_result row
+            # at all means the tool (sync agents included) is still executing,
+            # so completeness must fail closed like the neighboring gates.
+            subagent_still_running = tool_result_entry is None or (
+                is_async_agent_launch_result(tool_result_entry)
+                and (
+                    not isinstance(tool_result_entry, dict)
+                    or tool_result_entry.get("final_content") is None
+                )
             )
+            if cursor.should_emit(f"subagent:{tool_use_id or tool_key}", complete=not subagent_still_running):
+                subagent_end_timestamp = emit_subagent_observations(
+                    langfuse,
+                    parent_otel_span,
+                    subagent,
+                    tool_use_timestamp,
+                )
 
     tool_end_timestamp = _get_latest_timestamp(tool_result.result_timestamp, tool_use_timestamp)
     handoff_timestamp = (
@@ -1412,7 +1464,8 @@ def emit_single_tool_observation(
         or subagent_end_timestamp
         or assistant_timestamp
     )
-    tool_span.end(end_time=to_otel_nanoseconds(tool_end_timestamp))
+    if tool_span is not None:
+        tool_span.end(end_time=to_otel_nanoseconds(tool_end_timestamp))
 
     if tool_result.final_result_timestamp is not None and tool_result.final_output is not None:
         pending_async_tool_results.append({
@@ -1439,17 +1492,22 @@ def emit_tool_observation_batch(
     parent_otel_span: Any,
     turn: Turn,
     assistant_message: Dict[str, Any],
+    assistant_index: int,
     tool_uses: List[Dict[str, Any]],
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
     pending_subagents: List[Dict[str, Any]],
     pending_async_tool_results: List[Dict[str, Any]],
+    cursor: EmissionCursor,
 ) -> EmittedToolObservationBatch:
     assistant_timestamp = parse_timestamp(assistant_message)
+    generation_key = generation_emission_key(assistant_index, assistant_message)
     tool_result_timestamps: List[datetime] = []
     emitted_tool_results: List[Dict[str, Any]] = []
     latest_tool_end_timestamp: Optional[datetime] = None
 
-    for tool_use in tool_uses:
+    for tool_index, tool_use in enumerate(tool_uses):
+        tool_use_id = str(tool_use.get("id") or "")
+        tool_key = f"tool:{tool_use_id}" if tool_use_id else f"tool:{generation_key}:{tool_index}"
         emitted_tool = emit_single_tool_observation(
             langfuse,
             parent_otel_span,
@@ -1459,6 +1517,8 @@ def emit_tool_observation_batch(
             subagent_transcripts_by_tool_use_id,
             pending_subagents,
             pending_async_tool_results,
+            cursor,
+            tool_key,
         )
         if emitted_tool.handoff_timestamp is not None:
             tool_result_timestamps.append(emitted_tool.handoff_timestamp)
@@ -1588,14 +1648,38 @@ def emit_generation_observation(
 def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn,
                            start_timestamp: Optional[datetime],
                            generation_prefix: str = "LLM Call",
-                           subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[datetime]:
-    """Emit a turn's generations and tool observations under an existing span."""
+                           subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+                           cursor: Optional[EmissionCursor] = None) -> Optional[datetime]:
+    """Emit a turn's generations and tool observations under an existing span.
+
+    The full turn is always walked so cross-observation context (generation
+    inputs from previous tool results, timestamps) stays correct; the cursor
+    only gates which spans are actually created. Without a cursor everything
+    is emitted (one-shot behavior).
+    """
+    cursor = cursor if cursor is not None else fresh_cursor()
     user_text, _ = truncate_text(extract_text_from_content(get_content_from_row(turn.user_msg)))
     previous_timestamp = start_timestamp
     previous_tool_results: List[Dict[str, Any]] = []
     pending_async_tool_results: List[Dict[str, Any]] = []
     pending_subagents: List[Dict[str, Any]] = []
     latest_end_timestamp = start_timestamp
+    # True once the walk passed an async launch whose final result is still
+    # missing; later generations' inputs can then still change retroactively.
+    unresolved_async_launch_seen = False
+
+    def emit_pending_subagent(pending_subagent: Dict[str, Any]) -> None:
+        nonlocal latest_end_timestamp
+        subagent_key = f"subagent:{pending_subagent.get('tool_use_id')}"
+        if not cursor.should_emit(subagent_key, complete=True):
+            return
+        subagent_end_timestamp = emit_subagent_observations(
+            langfuse,
+            parent_otel_span,
+            pending_subagent["subagent"],
+            pending_subagent.get("display_start_timestamp") or pending_subagent.get("start_timestamp"),
+        )
+        latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
 
     for assistant_index, assistant_message in enumerate(turn.assistant_msgs):
         assistant_timestamp = parse_timestamp(assistant_message)
@@ -1605,13 +1689,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                 assistant_timestamp,
             )
             for ready_subagent in ready_subagents:
-                subagent_end_timestamp = emit_subagent_observations(
-                    langfuse,
-                    parent_otel_span,
-                    ready_subagent["subagent"],
-                    ready_subagent.get("display_start_timestamp") or ready_subagent.get("start_timestamp"),
-                )
-                latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
+                emit_pending_subagent(ready_subagent)
 
         ready_async_tool_results: List[Dict[str, Any]] = []
         if assistant_index > 0 and pending_async_tool_results:
@@ -1628,14 +1706,33 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             ready_async_tool_results,
         )
         generation_start_timestamp = previous_timestamp or assistant_timestamp
-        generation_span = emit_generation_observation(
-            langfuse,
-            parent_otel_span=parent_otel_span,
-            generation_prefix=generation_prefix,
-            assistant_index=assistant_index,
-            start_timestamp=generation_start_timestamp,
-            generation_kwargs=generation_kwargs,
+        # A generation is only complete when its emitted form cannot change
+        # anymore: (a) every tool_use of this message has its result (end
+        # time), (b) no earlier async launch is unresolved (a late
+        # notification would retroactively join this generation's input).
+        # The trailing message needs no extra guard: Stop only fires after a
+        # response is fully written, and no message.id ever grows across a
+        # Stop boundary (0 cases across all local transcripts).
+        generation_complete = (
+            not unresolved_async_launch_seen
+            and all(
+                str(tool_use.get("id") or "") in turn.tool_results_by_id
+                for tool_use in tool_uses
+            )
         )
+        generation_span = None
+        if cursor.should_emit(
+            generation_emission_key(assistant_index, assistant_message),
+            complete=generation_complete,
+        ):
+            generation_span = emit_generation_observation(
+                langfuse,
+                parent_otel_span=parent_otel_span,
+                generation_prefix=generation_prefix,
+                assistant_index=assistant_index,
+                start_timestamp=generation_start_timestamp,
+                generation_kwargs=generation_kwargs,
+            )
         update_pending_subagent_display_start_after_launch_response(
             pending_subagents,
             previous_tool_results,
@@ -1647,10 +1744,12 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             parent_otel_span,
             turn,
             assistant_message,
+            assistant_index,
             tool_uses,
             subagent_transcripts_by_tool_use_id,
             pending_subagents,
             pending_async_tool_results,
+            cursor,
         )
         latest_end_timestamp = _get_latest_timestamp(
             latest_end_timestamp,
@@ -1662,12 +1761,20 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             if emitted_tools.result_timestamps
             else assistant_timestamp
         )
-        generation_span.end(
-            end_time=to_otel_nanoseconds(
-                generation_end_timestamp or assistant_timestamp or previous_timestamp
+        if generation_span is not None:
+            generation_span.end(
+                end_time=to_otel_nanoseconds(
+                    generation_end_timestamp or assistant_timestamp or previous_timestamp
+                )
             )
-        )
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, generation_end_timestamp)
+
+        for tool_use in tool_uses:
+            entry = turn.tool_results_by_id.get(str(tool_use.get("id") or ""))
+            if is_async_agent_launch_result(entry) and (
+                not isinstance(entry, dict) or entry.get("final_content") is None
+            ):
+                unresolved_async_launch_seen = True
 
         previous_tool_results = emitted_tools.tool_results
         if emitted_tools.result_timestamps:
@@ -1676,13 +1783,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             previous_timestamp = assistant_timestamp
 
     for pending_subagent in pending_subagents:
-        subagent_end_timestamp = emit_subagent_observations(
-            langfuse,
-            parent_otel_span,
-            pending_subagent["subagent"],
-            pending_subagent.get("display_start_timestamp") or pending_subagent.get("start_timestamp"),
-        )
-        latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
+        emit_pending_subagent(pending_subagent)
 
     return latest_end_timestamp
 
