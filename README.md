@@ -49,7 +49,7 @@ Get keys from your Langfuse project settings → API Keys.
 
 One of:
 
-- [uv](https://docs.astral.sh/uv/) (recommended) on `PATH`. The hook uses `uv run --script` and installs the Langfuse SDK from the script metadata automatically. In addition to your `PATH`, the hook also looks in the standard install locations `~/.local/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`.
+- [uv](https://docs.astral.sh/uv/) (recommended) on `PATH`. The hook uses `uv run --script` and installs the Langfuse SDK from the script metadata automatically.
 - Python 3.10+ as `python3` with `langfuse>=4.0,<5` installed in that Python environment. This is only used as a fallback when `uv` is not on `PATH`.
 
 On the first hook run, uv downloads the Langfuse SDK from PyPI (declared in the script header) and caches it. Offline or proxied machines fail this download and retry on every turn until the cache is warm; you can pre-warm it from a networked terminal:
@@ -184,8 +184,8 @@ Nearly every failure explains itself in `~/.claude/state/langfuse_hook.log`. Sen
 
 | What the log shows | Meaning | What to do |
 | --- | --- | --- |
-| No new lines at all | The hook never launched. Either the plugin is disabled, no usable runtime was found (no `uv`, no suitable `python3`), or uv could not download the SDK (offline/proxy) | Run `claude plugin list` **from the directory you use in the app**, since enable/disable can be project-scoped. Install uv in a standard location. Pre-warm the SDK download (see Requirements) |
-| `langfuse import failed (…) python=… PATH=…` | The Python that ran the hook cannot import the SDK; the line names the interpreter, version, and PATH | Install uv in a standard location, or make sure `python3` is 3.10+ with `langfuse>=4.0,<5` installed |
+| No new lines at all | The hook never launched. Either the plugin is disabled, no usable runtime was found (no `uv`, no suitable `python3`), or uv could not download the SDK (offline/proxy) | Run `claude plugin list` **from the directory you use in the app**, since enable/disable can be project-scoped. Install uv and make sure it is on the PATH of the app that launches Claude Code. Pre-warm the SDK download (see Requirements) |
+| `langfuse import failed (…) python=… PATH=…` | The Python that ran the hook cannot import the SDK; the line names the interpreter, version, and PATH | Install uv and make sure it is on the PATH the hook inherits (the log line shows that PATH), or make sure `python3` is 3.10+ with `langfuse>=4.0,<5` installed |
 | `Langfuse config incomplete: missing …` | The named key(s) did not reach the hook. Either not configured yet, or configured but not delivered | Configure via `/plugin configure`. If the line also says `loaded under plugin identity '@inline'`, see the desktop section below |
 | `Hook started` plus a skip reason (e.g. `Transcript path does not exist`) | The hook ran and skipped intentionally; these often come from background/utility sessions | Usually harmless. File an issue with the log line if actual turns are missing |
 | `Processed N turns …` but nothing in Langfuse | Turns were handed to the SDK but delivery failed afterwards; export errors go to stderr, not this log | Check `LANGFUSE_BASE_URL` (EU `https://cloud.langfuse.com` vs US `https://us.cloud.langfuse.com`), key validity, and network/proxy reachability |

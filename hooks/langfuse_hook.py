@@ -156,7 +156,10 @@ except Exception as e:
     info(
         f"langfuse import failed ({type(e).__name__}: {e}); "
         f"python={sys.version.split()[0]} executable={sys.executable} "
-        f"PATH={os.environ.get('PATH', '')}"
+        f"PATH={os.environ.get('PATH', '')}. "
+        "Hint: uv was not found on this PATH. If uv is installed, check that its "
+        "location is on the PATH seen by the app that launches Claude Code; "
+        "GUI apps often use a minimal PATH."
     )
     sys.exit(0)
 

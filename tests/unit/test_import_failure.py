@@ -33,3 +33,4 @@ def test_import_failure_logs_and_exits_cleanly(tmp_path: Path, monkeypatch: pyte
     assert sys.version.split()[0] in log_text
     assert sys.executable in log_text
     assert "PATH=" in log_text
+    assert "Hint: uv was not found on this PATH" in log_text
