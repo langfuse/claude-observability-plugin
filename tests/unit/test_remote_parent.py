@@ -41,3 +41,20 @@ def test_remote_parent_nests_under_stored_root_span_id(hook_module, fake_langfus
 def test_remote_parent_requires_user_row_uuid(hook_module, fake_langfuse):
     assert hook_module.remote_parent(fake_langfuse, "sess-1", None) is None
     assert hook_module.remote_parent(fake_langfuse, "sess-1", "") is None
+
+
+def test_remote_parent_prefers_stored_trace_id_over_derivation(hook_module, fake_langfuse):
+    # Continuation firings pass the trace id stored at root creation; it must
+    # win over the session:uuid derivation so seeded turns resume into the
+    # same trace instead of jumping to a differently-derived one.
+    stored = "ab" * 16
+
+    parent = hook_module.remote_parent(fake_langfuse, "sess-1", "row-uuid-1", trace_id=stored)
+
+    assert parent.get_span_context().trace_id == int(stored, 16)
+
+
+def test_remote_parent_ignores_malformed_stored_trace_id(hook_module, fake_langfuse):
+    parent = hook_module.remote_parent(fake_langfuse, "sess-1", "row-uuid-1", trace_id="not-hex")
+
+    assert parent.get_span_context().trace_id == expected_trace_id_int("sess-1", "row-uuid-1")

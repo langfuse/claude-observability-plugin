@@ -65,12 +65,14 @@ class LangfuseConfig:
     secret_key: str
     host: str
     user_id: Optional[str]
+    trace_seed: Optional[str] = None
 
 def get_langfuse_config() -> Optional[LangfuseConfig]:
     public_key = _opt("LANGFUSE_PUBLIC_KEY") or _opt("CC_LANGFUSE_PUBLIC_KEY")
     secret_key = _opt("LANGFUSE_SECRET_KEY") or _opt("CC_LANGFUSE_SECRET_KEY")
     host = _opt("LANGFUSE_BASE_URL") or _opt("CC_LANGFUSE_BASE_URL") or "https://us.cloud.langfuse.com"
     user_id = _opt("LANGFUSE_USER_ID") or _opt("CC_LANGFUSE_USER_ID") or None
+    trace_seed = _opt("CC_LANGFUSE_TRACE_SEED") or None
 
     if not public_key or not secret_key:
         return None
@@ -80,6 +82,7 @@ def get_langfuse_config() -> Optional[LangfuseConfig]:
         secret_key=secret_key,
         host=host,
         user_id=user_id,
+        trace_seed=trace_seed,
     )
 
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
@@ -1162,10 +1165,80 @@ def _get_latest_timestamp(*timestamps: Optional[datetime]) -> Optional[datetime]
     present_timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
     return max(present_timestamps) if present_timestamps else None
 
+# ---- Deterministic trace ids ----
+def _is_valid_trace_id_hex(trace_id: Any) -> bool:
+    if not isinstance(trace_id, str) or len(trace_id) != 32:
+        return False
+    try:
+        return int(trace_id, 16) != 0
+    except ValueError:
+        return False
+
+def derive_turn_trace_id(trace_seed: str, turn_number: int) -> Optional[str]:
+    """Derive the deterministic W3C trace id for a turn from CC_LANGFUSE_TRACE_SEED.
+
+    Formula: Langfuse.create_trace_id(seed=f"{trace_seed}:{turn_number}") — which
+    is sha256(seed_string).hexdigest()[:32]. The explicit sha256 fallback keeps
+    IDs identical to what external callers precompute with the SDK helper even
+    if the helper itself is unavailable.
+    """
+    seed_string = f"{trace_seed}:{turn_number}"
+    try:
+        create_trace_id = getattr(Langfuse, "create_trace_id", None)
+        if callable(create_trace_id):
+            trace_id = create_trace_id(seed=seed_string)
+            if _is_valid_trace_id_hex(trace_id):
+                return trace_id.lower()
+    except Exception as e:
+        debug(f"Langfuse.create_trace_id failed for {seed_string!r}: {e}")
+    try:
+        return hashlib.sha256(seed_string.encode("utf-8")).hexdigest()[:32]
+    except Exception:
+        return None
+
+def _build_forced_trace_context(trace_id_hex: str) -> Optional[Any]:
+    """Build an OTel context whose remote parent carries the forced trace id.
+
+    A root span started within this context adopts the trace id; its children
+    keep inheriting it as usual. Returns None (caller falls back to an
+    auto-generated id) when the context cannot be built.
+    """
+    try:
+        trace_id = int(trace_id_hex, 16)
+        if trace_id == 0:
+            return None
+        span_id = 0
+        while span_id == 0:
+            span_id = random.getrandbits(64)
+        parent_span_context = otel_trace_api.SpanContext(
+            trace_id=trace_id,
+            span_id=span_id,
+            is_remote=True,
+            trace_flags=otel_trace_api.TraceFlags(otel_trace_api.TraceFlags.SAMPLED),
+        )
+        return otel_trace_api.set_span_in_context(
+            otel_trace_api.NonRecordingSpan(parent_span_context)
+        )
+    except Exception as e:
+        debug(f"forced trace context for {trace_id_hex!r} failed: {e}")
+        return None
+
+def _start_root_otel_span(langfuse: Langfuse, name: str, start_ns: Optional[int],
+                          forced_trace_id: Optional[str]) -> Any:
+    if forced_trace_id:
+        context = _build_forced_trace_context(forced_trace_id)
+        if context is not None:
+            try:
+                return langfuse._otel_tracer.start_span(name=name, start_time=start_ns, context=context)
+            except Exception as e:
+                debug(f"start_span with forced trace id {forced_trace_id!r} failed: {e}")
+    return langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+
 def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
                      start_time: Optional[datetime],
                      parent_otel_span: Any = None,
                      as_root: bool = False,
+                     forced_trace_id: Optional[str] = None,
                      **obs_kwargs: Any) -> Any:
     """Create a Langfuse observation with an explicit OTel start_time.
 
@@ -1193,7 +1266,7 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
         with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
             otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
     else:
-        otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+        otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id)
     if as_root:
         # SDK/server contract: spans under a synthetic trace-id carrier have a
         # parentSpanId that never exports, so the server only treats them as
@@ -1213,17 +1286,61 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
     )
 
 # ---- Trace naming and tags ----
-def collect_skill_tags(turn: Turn) -> List[str]:
-    """Return 'skill:<name>' tags for every Skill tool invocation in the turn."""
-    names: List[str] = []
-    for assistant_message in turn.assistant_msgs:
-        for tool_use in get_tool_use_blocks(get_content_from_row(assistant_message)):
+def add_skill_tags_from_rows(rows: List[Dict[str, Any]], names: List[str], prefix: str) -> None:
+    """Collect '<prefix><name>' tags for every skill trail in the rows.
+
+    Skills leave two different transcript trails: a tool_use block named
+    "Skill" when Claude invokes the skill itself, and a top-level
+    attributionSkill field on assistant rows when the user invokes it as a
+    slash command (which never produces a Skill tool_use block).
+    """
+    def add_skill(skill: Any) -> None:
+        if isinstance(skill, str) and skill and f"{prefix}{skill}" not in names:
+            names.append(f"{prefix}{skill}")
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        add_skill(row.get("attributionSkill"))
+        for tool_use in get_tool_use_blocks(get_content_from_row(row)):
             if tool_use.get("name") != "Skill":
                 continue
             tool_input = tool_use.get("input")
-            skill = tool_input.get("skill") if isinstance(tool_input, dict) else None
-            if isinstance(skill, str) and skill and f"skill:{skill}" not in names:
-                names.append(f"skill:{skill}")
+            add_skill(tool_input.get("skill") if isinstance(tool_input, dict) else None)
+
+
+def collect_skill_tags(turn: Turn) -> List[str]:
+    """Return 'skill:<name>' tags for every skill used in the turn itself."""
+    names: List[str] = []
+    add_skill_tags_from_rows(turn.assistant_msgs, names, "skill:")
+    return names
+
+
+def collect_subagent_skill_tags(
+    turn: Turn,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[str]:
+    """Return 'subagent-skill:<name>' tags for skills used inside the
+    subagent transcripts launched by this turn.
+
+    Kept in a separate tag namespace so 'skill:' keeps meaning "ran in the
+    main conversation" and both dimensions stay filterable independently.
+    """
+    if not subagent_transcripts_by_tool_use_id:
+        return []
+    names: List[str] = []
+    for assistant_message in turn.assistant_msgs:
+        for tool_use in get_tool_use_blocks(get_content_from_row(assistant_message)):
+            tool_use_id = str(tool_use.get("id") or "")
+            subagent = subagent_transcripts_by_tool_use_id.get(tool_use_id) if tool_use_id else None
+            if not isinstance(subagent, dict):
+                continue
+            path = subagent.get("path")
+            if not isinstance(path, Path):
+                continue
+            rows = read_subagent_jsonl(path)
+            if rows:
+                add_skill_tags_from_rows(rows, names, "subagent-skill:")
     return names
 
 def short_session_label(session_id: str, max_len: int = 12) -> str:
@@ -1239,10 +1356,14 @@ def short_session_label(session_id: str, max_len: int = 12) -> str:
 def trace_display_name(session_id: str, turn_num: int) -> str:
     return f"Claude Code - Turn {turn_num} ({short_session_label(session_id)})"
 
-def get_trace_tags(turn: Turn) -> List[str]:
+def get_trace_tags(
+    turn: Turn,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[str]:
     tags = ["claude-code"]
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
+        tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
     return tags
 
 # ---- Generation payloads ----
@@ -1940,7 +2061,8 @@ def is_valid_span_id_hex(span_id: Any) -> bool:
 
 
 def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
-                  root_span_id: Optional[str] = None) -> Optional[Any]:
+                  root_span_id: Optional[str] = None,
+                  trace_id: Optional[str] = None) -> Optional[Any]:
     """Return a carrier span pinning the turn's trace id, seeded from session
     id + the turn's user-row uuid.
 
@@ -1949,6 +2071,11 @@ def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
     the trace's roots. With root_span_id (the 16-hex observation id of a
     root span opened by an earlier firing) children nest under that span
     instead, so continuation firings can extend an already-emitted turn.
+
+    trace_id (32-hex) overrides the seeded derivation: continuation firings
+    pass the id stored at root creation so a turn never switches trace
+    mid-flight (e.g. when its root was opened under a
+    CC_LANGFUSE_TRACE_SEED-forced id).
     """
     if not isinstance(user_row_uuid, str) or not user_row_uuid:
         return None
@@ -1957,8 +2084,12 @@ def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
         # degrade to the phantom-parent path instead of the except fallback.
         debug(f"remote_parent: ignoring malformed root_span_id {root_span_id!r}")
         root_span_id = None
+    if trace_id is not None and not _is_valid_trace_id_hex(trace_id):
+        debug(f"remote_parent: ignoring malformed trace_id {trace_id!r}")
+        trace_id = None
     try:
-        trace_id = langfuse.create_trace_id(seed=f"{session_id}:{user_row_uuid}")
+        if trace_id is None:
+            trace_id = langfuse.create_trace_id(seed=f"{session_id}:{user_row_uuid}")
         parent_context = otel_trace_api.SpanContext(
             trace_id=int(trace_id, 16),
             span_id=int(root_span_id, 16) if root_span_id else (random.getrandbits(64) or 1),
@@ -1972,22 +2103,34 @@ def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
 
 
 def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
-                        transcript_path: Path) -> Any:
+                        transcript_path: Path, trace_seed: Optional[str] = None) -> Any:
     """Open the turn's root span, backdated to the user message.
 
     Kept separate from observe/close so incremental emission can run the
     phases in different hook invocations: the root span opens on the first
     firing that sees the turn and closes only when the turn does.
+
+    With trace_seed set (CC_LANGFUSE_TRACE_SEED) the root adopts the
+    externally precomputable trace id derived from seed and turn number;
+    otherwise the session:user-row-uuid carrier pins the trace id.
     """
     user_text_raw = extract_text_from_content(get_content_from_row(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
     trace_metadata = build_trace_metadata(session_id, turn_num, turn, transcript_path, user_text_meta)
+    # Opt-in deterministic trace ids: fail open to the carrier-derived id.
+    forced_trace_id: Optional[str] = None
+    if trace_seed:
+        try:
+            forced_trace_id = derive_turn_trace_id(trace_seed, turn_num)
+        except Exception as e:
+            debug(f"trace id derivation failed for turn {turn_num}: {e}")
     return _start_backdated(
         langfuse,
         name="Conversational Turn",
         as_type="span",
         start_time=parse_timestamp(turn.user_msg),
-        parent_otel_span=remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
+        parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
+        forced_trace_id=forced_trace_id,
         as_root=True,
         input={"role": "user", "content": user_text},
         metadata=trace_metadata,
@@ -2087,7 +2230,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
               user_id: Optional[str] = None,
               subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
               progress: Optional[Dict[str, Any]] = None,
-              close: bool = True) -> Dict[str, Any]:
+              close: bool = True,
+              trace_seed: Optional[str] = None) -> Dict[str, Any]:
     """Emit a turn, resuming from prior firings' progress.
 
     With no progress and close=True this is the classic one-shot emission.
@@ -2105,21 +2249,26 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         session_id=session_id,
         user_id=user_id,
         trace_name=trace_display_name(session_id, turn_num),
-        tags=get_trace_tags(turn),
+        tags=get_trace_tags(turn, subagent_transcripts_by_tool_use_id),
     ):
         trace_span = None
         root_span_id = progress.get("root_span_id")
         if not is_valid_span_id_hex(root_span_id):
-            trace_span = open_turn_root_span(langfuse, session_id, turn_num, turn, transcript_path)
+            trace_span = open_turn_root_span(
+                langfuse, session_id, turn_num, turn, transcript_path, trace_seed=trace_seed
+            )
             root_span_id = getattr(trace_span, "id", None)
             progress["root_span_id"] = root_span_id
             progress["trace_id"] = getattr(trace_span, "trace_id", None)
             parent_otel_span = trace_span._otel_span
         else:
             # Root span exported by an earlier firing: attach children to it
-            # via a carrier and correct the root itself via span-update.
+            # via a carrier and correct the root itself via span-update. The
+            # stored trace id wins over re-derivation so seeded turns resume
+            # into the same trace.
             parent_otel_span = remote_parent(
-                langfuse, session_id, turn.user_msg.get("uuid"), root_span_id=root_span_id
+                langfuse, session_id, turn.user_msg.get("uuid"),
+                root_span_id=root_span_id, trace_id=progress.get("trace_id"),
             )
         obs_end_ts = emit_turn_observations(
             langfuse,
@@ -2177,6 +2326,7 @@ def emit_and_close_ready_turns(
     *,
     user_id: Optional[str],
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
+    trace_seed: Optional[str] = None,
 ) -> int:
     emitted = 0
     # Turns without a user-row uuid bypass assign_turn_numbers; seed their
@@ -2206,6 +2356,7 @@ def emit_and_close_ready_turns(
                 subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
                 progress=progress,
                 close=True,
+                trace_seed=trace_seed,
             )
         except Exception as e:
             # Log at INFO so SDK incompatibilities (and other emit failures)
@@ -2224,6 +2375,7 @@ def emit_ready_observations_of_open_turn(
     *,
     user_id: Optional[str],
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
+    trace_seed: Optional[str] = None,
 ) -> None:
     """Emit the held open turn's ready observations at this firing (ready =
     the emitted form can no longer change; see the EmissionCursor gates).
@@ -2257,6 +2409,7 @@ def emit_ready_observations_of_open_turn(
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
             progress=progress if isinstance(progress, dict) else None,
             close=False,
+            trace_seed=trace_seed,
         )
         session_state.turn_progress[user_row_uuid] = progress
     except Exception as e:
@@ -2305,6 +2458,7 @@ def emit_new_turns_from_transcript(
                 update_sink,
                 user_id=config.user_id,
                 subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                trace_seed=config.trace_seed,
             )
 
         session_state.turn_count += emitted
@@ -2320,6 +2474,7 @@ def emit_new_turns_from_transcript(
             update_sink,
             user_id=config.user_id,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            trace_seed=config.trace_seed,
         )
 
         # Known limitation (accepted, like the crash-between-emit-and-save

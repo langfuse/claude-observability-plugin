@@ -40,6 +40,7 @@ The plugin requires or accepts:
 | `CC_LANGFUSE_MAX_CHARS` | Truncate captured inputs/outputs to this many characters (default 20000).                          |
 | `CC_LANGFUSE_SKILL_TAGS` | Tag traces with `skill:<name>` for every skill invoked in the turn (default true).                 |
 | `CC_LANGFUSE_CAPTURE_SKILL_CONTENT` | Include injected skill instruction text in the Skill tool span output (default false).  |
+| `CC_LANGFUSE_TRACE_SEED` | Optional. Opt-in seed for deterministic trace IDs — see [Deterministic trace IDs](#deterministic-trace-ids). |
 
 Get keys from your Langfuse project settings → API Keys.
 
@@ -70,6 +71,58 @@ Not captured:
 If you use the desktop app, switch to Code mode for hook-backed tracing. Regular Chat mode does not invoke Claude Code Stop or SessionEnd hooks and does not write the transcript file this plugin reads.
 
 State is kept in `~/.claude/state/langfuse_state.json` so re-runs only emit new turns.
+
+## Deterministic trace IDs
+
+By default, trace IDs are auto-generated, so external systems (CI harnesses, benchmark
+runners, dataset-experiment services) that run Claude Code headlessly have to poll the
+Langfuse API to discover the trace ID of a run. Setting `CC_LANGFUSE_TRACE_SEED` makes
+trace IDs predictable: any system that knows the seed can compute the trace ID of each
+turn **before** the trace exists.
+
+With the seed set, the trace ID for turn `N` (1-based, counted per session across hook
+runs) is derived as:
+
+```python
+from langfuse import Langfuse
+
+trace_id = Langfuse.create_trace_id(seed=f"{CC_LANGFUSE_TRACE_SEED}:{turn_number}")
+# equivalent to: hashlib.sha256(f"{seed}:{turn_number}".encode()).hexdigest()[:32]
+```
+
+Use a **unique seed per session** — otherwise two sessions collide on the same trace
+IDs. The recommended seed is the Claude session UUID you already pass via
+`claude -p --session-id`.
+
+Example: a harness runs a single-turn headless prompt and links the resulting trace to
+a Langfuse dataset run item without ever fetching the trace:
+
+```python
+import subprocess, uuid, os
+from langfuse import Langfuse
+
+langfuse = Langfuse()
+session_id = str(uuid.uuid4())
+
+# Precompute the trace ID for turn 1 — no polling needed.
+trace_id = Langfuse.create_trace_id(seed=f"{session_id}:1")
+
+# Link it to a dataset run item BEFORE the run.
+langfuse.api.dataset_run_items.create(
+    dataset_item_id=item.id,
+    run_name="claude-code-benchmark-v1",
+    trace_id=trace_id,
+)
+
+subprocess.run(
+    ["claude", "-p", "Refactor utils.py", "--session-id", session_id],
+    env={**os.environ, "CC_LANGFUSE_TRACE_SEED": session_id},
+)
+# When the hook uploads the turn, its trace appears in Langfuse under trace_id.
+```
+
+If derivation or wiring fails for any reason, the hook falls back to an auto-generated
+trace ID (fail-open, like the rest of the hook). Unset or empty seed = unchanged behavior.
 
 ## Privacy
 

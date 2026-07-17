@@ -21,7 +21,12 @@ def _install_langfuse_stubs() -> None:
     langfuse_module = types.ModuleType("langfuse")
 
     class Langfuse:
-        pass
+        @staticmethod
+        def create_trace_id(*, seed: str | None = None) -> str:
+            # Mirrors langfuse v4: seeded trace ids are sha256(seed)[:32].
+            if seed:
+                return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+            return "f" * 32
 
     @contextlib.contextmanager
     def propagate_attributes(**_: Any) -> Iterator[None]:
@@ -38,27 +43,31 @@ def _install_langfuse_stubs() -> None:
     def use_span(*_: Any, **__: Any) -> Iterator[None]:
         yield
 
+    class TraceFlags(int):
+        SAMPLED = 0x01
+
     class SpanContext:
-        def __init__(self, *, trace_id: int, span_id: int, trace_flags: int, is_remote: bool) -> None:
+        def __init__(self, trace_id: int, span_id: int, is_remote: bool, trace_flags: Any = None) -> None:
             self.trace_id = trace_id
             self.span_id = span_id
-            self.trace_flags = trace_flags
             self.is_remote = is_remote
-
-    class TraceFlags(int):
-        pass
+            self.trace_flags = trace_flags
 
     class NonRecordingSpan:
-        def __init__(self, context: SpanContext) -> None:
-            self._context = context
+        def __init__(self, span_context: SpanContext) -> None:
+            self._span_context = span_context
 
         def get_span_context(self) -> SpanContext:
-            return self._context
+            return self._span_context
+
+    def set_span_in_context(span: Any, context: Any = None) -> dict[str, Any]:
+        return {"current_span": span}
 
     trace_module.use_span = use_span
-    trace_module.SpanContext = SpanContext
     trace_module.TraceFlags = TraceFlags
+    trace_module.SpanContext = SpanContext
     trace_module.NonRecordingSpan = NonRecordingSpan
+    trace_module.set_span_in_context = set_span_in_context
     opentelemetry_module.trace = trace_module
     sys.modules["opentelemetry"] = opentelemetry_module
     sys.modules["opentelemetry.trace"] = trace_module
@@ -95,9 +104,10 @@ def read_fixture_jsonl() -> Any:
 
 
 class FakeOtelSpan:
-    def __init__(self, name: str, start_time: int | None) -> None:
+    def __init__(self, name: str, start_time: int | None, context: Any = None) -> None:
         self.name = name
         self.start_time = start_time
+        self.context = context
         self.attributes: dict[str, Any] = {}
 
     def set_attribute(self, key: str, value: Any) -> None:
@@ -105,8 +115,8 @@ class FakeOtelSpan:
 
 
 class FakeTracer:
-    def start_span(self, *, name: str, start_time: int | None = None) -> FakeOtelSpan:
-        return FakeOtelSpan(name, start_time)
+    def start_span(self, *, name: str, start_time: int | None = None, context: Any = None) -> FakeOtelSpan:
+        return FakeOtelSpan(name, start_time, context)
 
 
 _fake_observation_counter = itertools.count(1)

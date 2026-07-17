@@ -56,6 +56,11 @@
       "title": "Capture skill instructions",
       "description": "Include the injected skill instruction text in the Skill tool span output",
       "default": false
+    },
+    "CC_LANGFUSE_TRACE_SEED": {
+      "type": "string",
+      "title": "Trace ID seed",
+      "description": "Optional. Derive deterministic trace ids as Langfuse.create_trace_id(seed=f\"{seed}:{turn_number}\") so external systems can precompute them. Use a unique seed per session (e.g. the --session-id UUID). Leave empty for auto-generated ids."
     }
   }
 }
