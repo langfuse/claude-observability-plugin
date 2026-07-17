@@ -2159,6 +2159,14 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
 
 
 # ---- New turn emission orchestration ----
+def pop_turn_progress(session_state: SessionState, turn: Turn) -> Optional[Dict[str, Any]]:
+    user_row_uuid = turn.user_msg.get("uuid")
+    if not isinstance(user_row_uuid, str) or not user_row_uuid:
+        return None
+    entry = session_state.turn_progress.pop(user_row_uuid, None)
+    return entry if isinstance(entry, dict) else None
+
+
 def emit_and_close_ready_turns(
     langfuse: Langfuse,
     session_id: str,
@@ -2183,6 +2191,9 @@ def emit_and_close_ready_turns(
         if turn_num is None:
             turn_num = next_fallback_turn_number
             next_fallback_turn_number += 1
+        # Progress from firings while this turn was still open; closing the
+        # turn consumes it so the emitted keys don't outlive the turn.
+        progress = pop_turn_progress(session_state, turn)
         try:
             emit_turn(
                 langfuse,
@@ -2193,7 +2204,7 @@ def emit_and_close_ready_turns(
                 update_sink,
                 user_id=user_id,
                 subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
-                progress=None,
+                progress=progress,
                 close=True,
             )
         except Exception as e:
@@ -2202,6 +2213,54 @@ def emit_and_close_ready_turns(
             info(f"emit_turn failed: {type(e).__name__}: {e}")
     return emitted
 
+
+def emit_ready_observations_of_open_turn(
+    langfuse: Langfuse,
+    session_id: str,
+    transcript_path: Path,
+    session_state: SessionState,
+    task_id_to_tool_use_id: Dict[str, str],
+    update_sink: List[Dict[str, Any]],
+    *,
+    user_id: Optional[str],
+    subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
+) -> None:
+    """Emit the held open turn's ready observations at this firing (ready =
+    the emitted form can no longer change; see the EmissionCursor gates).
+
+    The turn stays open (rows keep being held); only its emission progress
+    advances in session_state.turn_progress. Turns without a user-row uuid
+    cannot carry progress across firings and keep the close-time behavior.
+    """
+    held_rows = session_state.open_turn.get("rows") if isinstance(session_state.open_turn, dict) else None
+    if not isinstance(held_rows, list) or not held_rows:
+        return
+    _, trailing_turn, _ = assemble_turns(held_rows, task_id_to_tool_use_id)
+    if trailing_turn is None:
+        return
+    user_row_uuid = trailing_turn.user_msg.get("uuid")
+    if not isinstance(user_row_uuid, str) or not user_row_uuid:
+        return
+    turn_num = session_state.turn_numbers.get(user_row_uuid)
+    if turn_num is None:
+        return
+    progress = session_state.turn_progress.get(user_row_uuid)
+    try:
+        progress = emit_turn(
+            langfuse,
+            session_id,
+            turn_num,
+            trailing_turn,
+            transcript_path,
+            update_sink,
+            user_id=user_id,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            progress=progress if isinstance(progress, dict) else None,
+            close=False,
+        )
+        session_state.turn_progress[user_row_uuid] = progress
+    except Exception as e:
+        info(f"emitting ready observations of open turn failed: {type(e).__name__}: {e}")
 
 def emit_new_turns_from_transcript(
     langfuse: Langfuse,
@@ -2229,27 +2288,44 @@ def emit_new_turns_from_transcript(
             subagent_transcripts_by_tool_use_id,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
         )
-        if not turns:
-            save_session_state(state, key, session_state)
-            return 0
 
-        turns_to_emit = get_turns_to_emit(
-            turns,
-            session_state,
-            flush_deferred_agent_turns=flush_deferred_agent_turns,
-        )
-        emitted = emit_and_close_ready_turns(
+        emitted = 0
+        if turns:
+            turns_to_emit = get_turns_to_emit(
+                turns,
+                session_state,
+                flush_deferred_agent_turns=flush_deferred_agent_turns,
+            )
+            emitted = emit_and_close_ready_turns(
+                langfuse,
+                session_id,
+                transcript_path,
+                turns_to_emit,
+                session_state,
+                update_sink,
+                user_id=config.user_id,
+                subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            )
+
+        session_state.turn_count += emitted
+
+        # D1: the still-open trailing turn emits its ready observations at
+        # every firing; its trace appears at the first Stop and grows.
+        emit_ready_observations_of_open_turn(
             langfuse,
             session_id,
             transcript_path,
-            turns_to_emit,
             session_state,
+            get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
             update_sink,
             user_id=config.user_id,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
         )
 
-        session_state.turn_count += emitted
+        # Known limitation (accepted, like the crash-between-emit-and-save
+        # duplicate window): progress is persisted before the SDK flush in
+        # main(); a dropped flush leaves emitted_keys pointing at spans that
+        # never reached the server.
         save_session_state(state, key, session_state)
 
     post_ingestion_events(config, update_sink)

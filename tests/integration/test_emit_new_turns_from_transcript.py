@@ -79,6 +79,31 @@ def test_emit_new_turns_defers_async_agent_until_session_end_flush(
     assert next(iter(state.values()))["pending_agent_turns"] == []
 
 
+def test_idle_firings_send_no_root_updates(
+    hook_module,
+    fixture_transcript_path,
+    fake_langfuse,
+    isolated_hook_state,
+    recorded_ingestion_events,
+):
+    # Every queued update becomes a row version server-side; idle firings
+    # (nothing newly emitted) must therefore stay silent, close must not.
+    transcript = fixture_transcript_path("async_agent_deferred")
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-gate", transcript)
+    after_first_firing = len(recorded_ingestion_events)
+
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-gate", transcript)
+    assert len(recorded_ingestion_events) == after_first_firing
+
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config, "session-gate", transcript, flush_deferred_agent_turns=True
+    )
+    update_types = [e["type"] for e in recorded_ingestion_events[after_first_firing:]]
+    assert "span-update" in update_types
+
+
 def test_only_the_turn_root_span_is_marked_as_root(
     hook_module,
     fixture_transcript_path,
