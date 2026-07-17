@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import itertools
 import importlib.util
 import json
 import sys
@@ -108,6 +109,9 @@ class FakeTracer:
         return FakeOtelSpan(name, start_time)
 
 
+_fake_observation_counter = itertools.count(1)
+
+
 class FakeObservation:
     def __init__(self, otel_span: FakeOtelSpan, as_type: str, kwargs: dict[str, Any]) -> None:
         self._otel_span = otel_span
@@ -116,6 +120,10 @@ class FakeObservation:
         self.kwargs = kwargs
         self.output: Any = None
         self.end_time: int | None = None
+        # Mirror the SDK's hex id/trace_id attributes (span.py sets both).
+        n = next(_fake_observation_counter)
+        self.id = f"{n:016x}"
+        self.trace_id = f"{n:032x}"
 
     def update(self, **kwargs: Any) -> None:
         if "output" in kwargs:
@@ -152,6 +160,15 @@ class FakeLangfuse:
 @pytest.fixture
 def fake_langfuse() -> FakeLangfuse:
     return FakeLangfuse()
+
+
+@pytest.fixture(autouse=True)
+def recorded_ingestion_events(hook_module: Any, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Keep the suite hermetic: the post-lock ingestion POST never reaches the
+    network; tests can assert on the recorded span-update/trace-create events."""
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(hook_module, "post_ingestion_events", lambda config, events: sent.extend(events))
+    return sent
 
 
 @pytest.fixture

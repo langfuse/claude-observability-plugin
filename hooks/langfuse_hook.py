@@ -10,6 +10,7 @@ Claude Code -> Langfuse hook
 
 """
 
+import base64
 import json
 import logging
 import os
@@ -18,6 +19,8 @@ import sys
 import threading
 import time
 import hashlib
+import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -1989,6 +1992,78 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         input={"role": "user", "content": user_text},
         metadata=trace_metadata,
     )
+
+
+def queue_root_span_update(update_sink: List[Dict[str, Any]], trace_id: Any, root_span_id: Any,
+                           *, start_time: Optional[datetime] = None,
+                           end_time: Optional[datetime] = None,
+                           input_payload: Any = None, output: Any = None,
+                           metadata: Optional[Dict[str, Any]] = None) -> None:
+    """Queue span-update (+ trace output upsert) events for a provisionally
+    exported root span. Events are sent AFTER the state lock is released
+    (post_ingestion_events) so network latency never blocks other hook runs.
+
+    Callers pass the FULL root payload (name/startTime/input/metadata, not
+    just the changed output/endTime): the ingestion worker may process an
+    update before the original row is queryable, making the update version a
+    standalone row — and whichever version survives the ClickHouse merge
+    must have no holes.
+    """
+    if not is_valid_span_id_hex(root_span_id) or not isinstance(trace_id, str) or not trace_id:
+        return
+    body: Dict[str, Any] = {"id": root_span_id, "traceId": trace_id, "name": "Conversational Turn"}
+    if start_time is not None:
+        body["startTime"] = start_time.isoformat()
+    if input_payload is not None:
+        body["input"] = input_payload
+    if end_time is not None:
+        body["endTime"] = end_time.isoformat()
+    if output is not None:
+        body["output"] = output
+    if metadata is not None:
+        body["metadata"] = metadata
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update_sink.append({
+        "id": str(uuid.uuid4()),
+        "timestamp": now_iso,
+        "type": "span-update",
+        "body": body,
+    })
+    if output is not None:
+        # The trace record derives input/output from the as_root span only at
+        # export time; a later span-update does not refresh it. Upsert the
+        # trace output explicitly so the dashboard header follows.
+        update_sink.append({
+            "id": str(uuid.uuid4()),
+            "timestamp": now_iso,
+            "type": "trace-create",
+            "body": {"id": trace_id, "output": output},
+        })
+
+
+def post_ingestion_events(config: LangfuseConfig, events: List[Dict[str, Any]]) -> None:
+    """Best-effort single POST to the batch ingestion API (fail-open).
+
+    The server upserts by id; it answers 207 even when individual events
+    fail, so the error list is logged explicitly (spike-v2 lesson).
+    """
+    if not events:
+        return
+    try:
+        payload = json.dumps({"batch": events}).encode("utf-8")
+        request = urllib.request.Request(
+            config.host.rstrip("/") + "/api/public/ingestion", data=payload, method="POST"
+        )
+        token = base64.b64encode(f"{config.public_key}:{config.secret_key}".encode("utf-8")).decode("ascii")
+        request.add_header("Authorization", f"Basic {token}")
+        request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(request, timeout=3) as response:
+            response_body = json.loads(response.read())
+            errors = response_body.get("errors") or []
+            if errors:
+                info(f"span-update partial failure: {json.dumps(errors, ensure_ascii=False)[:500]}")
+    except Exception as e:
+        info(f"ingestion update failed ({len(events)} event(s)): {type(e).__name__}: {e}")
 
 
 def observe_turn(langfuse: Langfuse, trace_span: Any, turn: Turn,
