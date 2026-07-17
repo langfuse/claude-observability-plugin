@@ -1921,25 +1921,43 @@ def build_trace_metadata(
             trace_metadata[dst_key] = value
     return trace_metadata
 
-def deterministic_trace_parent(langfuse: Langfuse, session_id: str, turn: Turn) -> Optional[Any]:
+def is_valid_span_id_hex(span_id: Any) -> bool:
+    return (
+        isinstance(span_id, str)
+        and len(span_id) == 16
+        and all(c in "0123456789abcdef" for c in span_id)
+    )
+
+
+def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
+                  root_span_id: Optional[str] = None) -> Optional[Any]:
     """Return a carrier span pinning the turn's trace id, seeded from session
-    id + the turn's user-row uuid."""
-    user_row_uuid = turn.user_msg.get("uuid")
+    id + the turn's user-row uuid.
+
+    Without root_span_id the carrier gets a phantom span id: it is never
+    exported, OTel merely requires a valid non-zero id, and children become
+    the trace's roots. With root_span_id (the 16-hex observation id of a
+    root span opened by an earlier firing) children nest under that span
+    instead, so continuation firings can extend an already-emitted turn.
+    """
     if not isinstance(user_row_uuid, str) or not user_row_uuid:
         return None
+    if root_span_id is not None and not is_valid_span_id_hex(root_span_id):
+        # A corrupt stored span id must not cost the deterministic trace id:
+        # degrade to the phantom-parent path instead of the except fallback.
+        debug(f"remote_parent: ignoring malformed root_span_id {root_span_id!r}")
+        root_span_id = None
     try:
         trace_id = langfuse.create_trace_id(seed=f"{session_id}:{user_row_uuid}")
         parent_context = otel_trace_api.SpanContext(
             trace_id=int(trace_id, 16),
-            # The carrier is never exported; OTel merely requires a valid
-            # non-zero span id here.
-            span_id=random.getrandbits(64) or 1,
+            span_id=int(root_span_id, 16) if root_span_id else (random.getrandbits(64) or 1),
             trace_flags=otel_trace_api.TraceFlags(0x01),  # sampled
             is_remote=False,
         )
         return otel_trace_api.NonRecordingSpan(parent_context)
     except Exception as e:
-        debug(f"deterministic_trace_parent failed, falling back to random trace id: {e}")
+        debug(f"remote_parent failed, falling back to random trace id: {e}")
         return None
 
 
@@ -1959,7 +1977,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         name="Conversational Turn",
         as_type="span",
         start_time=parse_timestamp(turn.user_msg),
-        parent_otel_span=deterministic_trace_parent(langfuse, session_id, turn),
+        parent_otel_span=remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
         as_root=True,
         input={"role": "user", "content": user_text},
         metadata=trace_metadata,

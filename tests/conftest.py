@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import json
 import sys
@@ -36,7 +37,27 @@ def _install_langfuse_stubs() -> None:
     def use_span(*_: Any, **__: Any) -> Iterator[None]:
         yield
 
+    class SpanContext:
+        def __init__(self, *, trace_id: int, span_id: int, trace_flags: int, is_remote: bool) -> None:
+            self.trace_id = trace_id
+            self.span_id = span_id
+            self.trace_flags = trace_flags
+            self.is_remote = is_remote
+
+    class TraceFlags(int):
+        pass
+
+    class NonRecordingSpan:
+        def __init__(self, context: SpanContext) -> None:
+            self._context = context
+
+        def get_span_context(self) -> SpanContext:
+            return self._context
+
     trace_module.use_span = use_span
+    trace_module.SpanContext = SpanContext
+    trace_module.TraceFlags = TraceFlags
+    trace_module.NonRecordingSpan = NonRecordingSpan
     opentelemetry_module.trace = trace_module
     sys.modules["opentelemetry"] = opentelemetry_module
     sys.modules["opentelemetry.trace"] = trace_module
@@ -109,6 +130,12 @@ class FakeLangfuse:
     def __init__(self) -> None:
         self._otel_tracer = FakeTracer()
         self.observations: list[FakeObservation] = []
+
+    @staticmethod
+    def create_trace_id(*, seed: str | None = None) -> str:
+        # Mirrors SDK 4.x: sha256(seed).digest()[:16].hex()
+        assert seed, "tests always pass a seed"
+        return hashlib.sha256(seed.encode("utf-8")).digest()[:16].hex()
 
     def _create_observation_from_otel_span(
         self,
