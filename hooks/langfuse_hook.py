@@ -1196,6 +1196,13 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
         # parentSpanId that never exports, so the server only treats them as
         # the trace root (deriving trace input/output/name) with this marker.
         otel_span.set_attribute("langfuse.internal.as_root", True)
+    else:
+        # The SDK span processor auto-marks spans whose parent this process
+        # never exported as langfuse.internal.is_app_root — true for every
+        # continuation-firing child under the carrier, which then shows up as
+        # a root in the events view. Children are never app roots; overriding
+        # the attribute wins over the processor's earlier write.
+        otel_span.set_attribute("langfuse.internal.is_app_root", False)
     return langfuse._create_observation_from_otel_span(
         otel_span=otel_span,
         as_type=as_type,

@@ -101,3 +101,6 @@ def test_only_the_turn_root_span_is_marked_as_root(
     assert roots and children
     assert all(o._otel_span.attributes.get("langfuse.internal.as_root") is True for o in roots)
     assert all("langfuse.internal.as_root" not in o._otel_span.attributes for o in children)
+    # Children explicitly opt out of the SDK's app-root auto-marking, so the
+    # events view never lists them as root observations.
+    assert all(o._otel_span.attributes.get("langfuse.internal.is_app_root") is False for o in children)
