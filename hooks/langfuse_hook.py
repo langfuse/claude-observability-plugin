@@ -42,8 +42,14 @@ LOCK_FILE = STATE_DIR / "langfuse_state.lock"
 
 # ----------------- Configuration -----------------
 def _opt(name: str) -> str:
-    """Read a plugin userConfig value (CLAUDE_PLUGIN_OPTION_<NAME>) with a fallback to a plain env var."""
-    return os.environ.get(f"CLAUDE_PLUGIN_OPTION_{name}") or os.environ.get(name) or ""
+    """Read a config value: plain env var first, plugin userConfig (CLAUDE_PLUGIN_OPTION_<NAME>) as fallback.
+
+    Claude Code stores userConfig at user (machine) scope only, while an `env` block in a
+    project's .claude/settings.local.json is per-repo. The plain env var wins so that a
+    multi-project machine can route each repo to its own Langfuse project; the wizard's
+    machine-wide value applies exactly where no repo-level value is set.
+    """
+    return os.environ.get(name) or os.environ.get(f"CLAUDE_PLUGIN_OPTION_{name}") or ""
 
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
