@@ -1192,10 +1192,15 @@ def get_task_id_to_tool_use_id(
 
 # ---- Low-level Langfuse helpers ----
 def to_otel_nanoseconds(ts: Optional[datetime]) -> Optional[int]:
-    """Convert a datetime to OTel-style nanoseconds since epoch."""
+    """Convert a datetime to OTel-style nanoseconds since epoch.
+
+    Rounded at microsecond precision: naive float math (timestamp() * 1e9
+    truncated with int()) lands just below the exact millisecond for many
+    values, shifting emitted times by -1ms vs the transcript.
+    """
     if ts is None:
         return None
-    return int(ts.timestamp() * 1_000_000_000)
+    return round(ts.timestamp() * 1_000_000) * 1_000
 
 def _get_latest_timestamp(*timestamps: Optional[datetime]) -> Optional[datetime]:
     present_timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
