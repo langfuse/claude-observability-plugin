@@ -10,7 +10,6 @@ Claude Code -> Langfuse hook
 
 """
 
-import base64
 import json
 import logging
 import os
@@ -19,8 +18,6 @@ import sys
 import threading
 import time
 import hashlib
-import urllib.request
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -499,8 +496,9 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
             session_state.pending_task_notifications = []
             session_state.open_turn = {}
             session_state.turn_numbers = {}
-            # Known limitation: root spans of partially emitted turns stay
-            # provisionally closed in Langfuse when rotation drops their progress.
+            # Known limitation: rotation drops emission progress, so re-read
+            # turns re-emit from scratch; an already-exported root keeps the
+            # output/end time it was emitted with.
             session_state.turn_progress = {}
         with open(transcript_path, "rb") as f:
             f.seek(session_state.offset)
@@ -764,6 +762,44 @@ def get_pending_agent_tool_use_ids(turn: Turn) -> List[str]:
             if is_async_agent_launch_result(tool_result_entry):
                 tool_use_ids.append(tool_use_id)
     return tool_use_ids
+
+
+def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[str]:
+    """Tool-use ids of task notifications that were enqueued (queue-operation
+    rows) but not yet delivered as a user row.
+
+    A queued result already fills the launch entry's final_content, so the
+    pending-agents check goes clean — yet the turn provably continues: the
+    delivery row and Claude's follow-up response are still outstanding.
+    Queue remove rows carry no notification content and cannot be matched, so
+    a removed notification keeps the gate closed until the turn ends — the
+    safe direction (close-time emission is always correct).
+    """
+    queued: List[str] = []
+    delivered = set()
+    for row in rows:
+        if not is_task_notification_row(row):
+            continue
+        tool_use_id = get_tool_use_id_from_task_notification(row)
+        if not tool_use_id:
+            continue
+        if row.get("type") == "queue-operation":
+            queued.append(tool_use_id)
+        else:
+            delivered.add(tool_use_id)
+    return [tool_use_id for tool_use_id in queued if tool_use_id not in delivered]
+
+
+def turn_has_unresolved_async_activity(turn: Turn) -> bool:
+    """True while the turn's emitted form can provably still change: an async
+    agent has not delivered its final result, or a notification is queued but
+    not yet delivered. Exported roots are immutable, so emission must wait
+    for this gate (or for the turn to close)."""
+    return bool(
+        get_pending_agent_tool_use_ids(turn)
+        or get_undelivered_queued_notification_ids(turn.rows)
+    )
+
 
 def get_turns_to_emit(
     turns: List[Turn],
@@ -2106,9 +2142,9 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
                         transcript_path: Path, trace_seed: Optional[str] = None) -> Any:
     """Open the turn's root span, backdated to the user message.
 
-    Kept separate from observe/close so incremental emission can run the
-    phases in different hook invocations: the root span opens on the first
-    firing that sees the turn and closes only when the turn does.
+    The root exports exactly once, at the first firing that is allowed to
+    emit the turn (async activity resolved, or turn closed); later firings
+    only attach children under it via the remote-parent carrier.
 
     With trace_seed set (CC_LANGFUSE_TRACE_SEED) the root adopts the
     externally precomputable trace id derived from seed and turn number;
@@ -2137,77 +2173,6 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
     )
 
 
-def queue_root_span_update(update_sink: List[Dict[str, Any]], trace_id: Any, root_span_id: Any,
-                           *, start_time: Optional[datetime] = None,
-                           end_time: Optional[datetime] = None,
-                           input_payload: Any = None, output: Any = None,
-                           metadata: Optional[Dict[str, Any]] = None) -> None:
-    """Queue span-update (+ trace output upsert) events for a provisionally
-    exported root span. Events are sent AFTER the state lock is released
-    (post_ingestion_events) so network latency never blocks other hook runs.
-
-    Callers pass the FULL root payload (name/startTime/input/metadata, not
-    just the changed output/endTime): the ingestion worker may process an
-    update before the original row is queryable, making the update version a
-    standalone row — and whichever version survives the ClickHouse merge
-    must have no holes.
-    """
-    if not is_valid_span_id_hex(root_span_id) or not isinstance(trace_id, str) or not trace_id:
-        return
-    body: Dict[str, Any] = {"id": root_span_id, "traceId": trace_id, "name": "Conversational Turn"}
-    if start_time is not None:
-        body["startTime"] = start_time.isoformat()
-    if input_payload is not None:
-        body["input"] = input_payload
-    if end_time is not None:
-        body["endTime"] = end_time.isoformat()
-    if output is not None:
-        body["output"] = output
-    if metadata is not None:
-        body["metadata"] = metadata
-    now_iso = datetime.now(timezone.utc).isoformat()
-    update_sink.append({
-        "id": str(uuid.uuid4()),
-        "timestamp": now_iso,
-        "type": "span-update",
-        "body": body,
-    })
-    if output is not None:
-        # The trace record derives input/output from the as_root span only at
-        # export time; a later span-update does not refresh it. Upsert the
-        # trace output explicitly so the dashboard header follows.
-        update_sink.append({
-            "id": str(uuid.uuid4()),
-            "timestamp": now_iso,
-            "type": "trace-create",
-            "body": {"id": trace_id, "output": output},
-        })
-
-
-def post_ingestion_events(config: LangfuseConfig, events: List[Dict[str, Any]]) -> None:
-    """Best-effort single POST to the batch ingestion API (fail-open).
-
-    The server upserts by id; it answers 207 even when individual events
-    fail, so the error list is logged explicitly (spike-v2 lesson).
-    """
-    if not events:
-        return
-    try:
-        payload = json.dumps({"batch": events}).encode("utf-8")
-        request = urllib.request.Request(
-            config.host.rstrip("/") + "/api/public/ingestion", data=payload, method="POST"
-        )
-        token = base64.b64encode(f"{config.public_key}:{config.secret_key}".encode("utf-8")).decode("ascii")
-        request.add_header("Authorization", f"Basic {token}")
-        request.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(request, timeout=3) as response:
-            response_body = json.loads(response.read())
-            errors = response_body.get("errors") or []
-            if errors:
-                info(f"span-update partial failure: {json.dumps(errors, ensure_ascii=False)[:500]}")
-    except Exception as e:
-        info(f"ingestion update failed ({len(events)} event(s)): {type(e).__name__}: {e}")
-
 
 def build_turn_output_payload(turn: Turn) -> Dict[str, Any]:
     last_assistant = turn.assistant_msgs[-1]
@@ -2226,7 +2191,6 @@ def get_root_span_end_time(turn: Turn, obs_end_ts: Optional[datetime]) -> Option
 
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
               turn: Turn, transcript_path: Path,
-              update_sink: List[Dict[str, Any]],
               user_id: Optional[str] = None,
               subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
               progress: Optional[Dict[str, Any]] = None,
@@ -2236,9 +2200,13 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
 
     With no progress and close=True this is the classic one-shot emission.
     With close=False only ready observations ship (those whose emitted form
-    can no longer change) and the root span is ended provisionally; a later
-    firing resumes from the returned progress (root span id + emitted keys)
-    and corrects the root via span-update.
+    can no longer change); a later firing resumes from the returned progress
+    (root span id + emitted keys) and adds what is still missing.
+
+    The root span exports exactly once, carrying the output/end time known
+    at that moment — exported spans are immutable, so callers must not emit
+    a turn whose root fields can provably still change (see
+    turn_has_unresolved_async_activity).
     """
     progress = dict(progress or {})
     cursor = EmissionCursor(
@@ -2263,9 +2231,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
             parent_otel_span = trace_span._otel_span
         else:
             # Root span exported by an earlier firing: attach children to it
-            # via a carrier and correct the root itself via span-update. The
-            # stored trace id wins over re-derivation so seeded turns resume
-            # into the same trace.
+            # via a carrier. The stored trace id wins over re-derivation so
+            # seeded turns resume into the same trace.
             parent_otel_span = remote_parent(
                 langfuse, session_id, turn.user_msg.get("uuid"),
                 root_span_id=root_span_id, trace_id=progress.get("trace_id"),
@@ -2278,30 +2245,12 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
             cursor=cursor,
         )
-        end_ts = get_root_span_end_time(turn, obs_end_ts)
-        output = build_turn_output_payload(turn)
         if trace_span is not None:
-            # OTel only exports ended spans, so the root closes now either
-            # way; a non-closing turn gets its final output/end via a later
-            # firing's span-update.
-            trace_span.update(output=output)
-            trace_span.end(end_time=to_otel_nanoseconds(end_ts))
-        elif close or cursor.newly_emitted:
-            # Idle firings send no root update: every update creates a row
-            # version on the server, visible as a transient duplicate root
-            # in the events view until ClickHouse merges the versions.
-            user_text, user_text_meta = truncate_text(
-                extract_text_from_content(get_content_from_row(turn.user_msg))
-            )
-            queue_root_span_update(
-                update_sink, progress.get("trace_id"), root_span_id,
-                start_time=parse_timestamp(turn.user_msg),
-                end_time=end_ts,
-                input_payload={"role": "user", "content": user_text},
-                output=output,
-                metadata=build_trace_metadata(
-                    session_id, turn_num, turn, transcript_path, user_text_meta
-                ),
+            # The root exports exactly once: end time and output are the
+            # values known now, and stay — exported fields are immutable.
+            trace_span.update(output=build_turn_output_payload(turn))
+            trace_span.end(
+                end_time=to_otel_nanoseconds(get_root_span_end_time(turn, obs_end_ts))
             )
     progress["emitted_keys"] = sorted(cursor.emitted)
     return progress
@@ -2322,7 +2271,6 @@ def emit_and_close_ready_turns(
     transcript_path: Path,
     turns_to_emit: List[Turn],
     session_state: SessionState,
-    update_sink: List[Dict[str, Any]],
     *,
     user_id: Optional[str],
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
@@ -2351,7 +2299,6 @@ def emit_and_close_ready_turns(
                 turn_num,
                 turn,
                 transcript_path,
-                update_sink,
                 user_id=user_id,
                 subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
                 progress=progress,
@@ -2371,24 +2318,32 @@ def emit_ready_observations_of_open_turn(
     transcript_path: Path,
     session_state: SessionState,
     task_id_to_tool_use_id: Dict[str, str],
-    update_sink: List[Dict[str, Any]],
     *,
     user_id: Optional[str],
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
     trace_seed: Optional[str] = None,
 ) -> None:
-    """Emit the held open turn's ready observations at this firing (ready =
-    the emitted form can no longer change; see the EmissionCursor gates).
+    """Emit the held open turn once its async activity is provably resolved.
 
-    The turn stays open (rows keep being held); only its emission progress
-    advances in session_state.turn_progress. Turns without a user-row uuid
-    cannot carry progress across firings and keep the close-time behavior.
+    Agent-less turns pass the gate at their own Stop and ship immediately;
+    turns with async activity ship at the first Stop after every agent
+    result has been delivered (empirically: the Stop right after Claude's
+    summary). The turn keeps being held either way; only its emission
+    progress advances in session_state.turn_progress. Exported roots are
+    final — if a turn grows after a clean Stop, later firings still add
+    children, but the root's output/end time stay as emitted.
     """
     held_rows = session_state.open_turn.get("rows") if isinstance(session_state.open_turn, dict) else None
     if not isinstance(held_rows, list) or not held_rows:
         return
     _, trailing_turn, _ = assemble_turns(held_rows, task_id_to_tool_use_id)
     if trailing_turn is None:
+        return
+    if turn_has_unresolved_async_activity(trailing_turn):
+        # The turn provably continues (pending agent result or queued,
+        # undelivered notification). Emitting now would freeze a wrong root
+        # output forever; everything ships at the first clean Stop instead.
+        debug("Open turn held: async activity unresolved (pending agent or undelivered notification)")
         return
     user_row_uuid = trailing_turn.user_msg.get("uuid")
     if not isinstance(user_row_uuid, str) or not user_row_uuid:
@@ -2404,7 +2359,6 @@ def emit_ready_observations_of_open_turn(
             turn_num,
             trailing_turn,
             transcript_path,
-            update_sink,
             user_id=user_id,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
             progress=progress if isinstance(progress, dict) else None,
@@ -2423,9 +2377,6 @@ def emit_new_turns_from_transcript(
     *,
     flush_deferred_agent_turns: bool = False,
 ) -> int:
-    # Ingestion updates are only collected while the lock is held and POSTed
-    # afterwards: network latency must never block concurrent hook runs.
-    update_sink: List[Dict[str, Any]] = []
     with FileLock(LOCK_FILE):
         state = load_hook_state()
         key = get_session_state_key(session_id, str(transcript_path))
@@ -2455,7 +2406,6 @@ def emit_new_turns_from_transcript(
                 transcript_path,
                 turns_to_emit,
                 session_state,
-                update_sink,
                 user_id=config.user_id,
                 subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
                 trace_seed=config.trace_seed,
@@ -2463,15 +2413,15 @@ def emit_new_turns_from_transcript(
 
         session_state.turn_count += emitted
 
-        # D1: the still-open trailing turn emits its ready observations at
-        # every firing; its trace appears at the first Stop and grows.
+        # The still-open trailing turn ships once its async activity is
+        # provably resolved (agent-less turns: at their own Stop); until
+        # then its rows keep being held and nothing is emitted.
         emit_ready_observations_of_open_turn(
             langfuse,
             session_id,
             transcript_path,
             session_state,
             get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
-            update_sink,
             user_id=config.user_id,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
             trace_seed=config.trace_seed,
@@ -2483,7 +2433,6 @@ def emit_new_turns_from_transcript(
         # never reached the server.
         save_session_state(state, key, session_state)
 
-    post_ingestion_events(config, update_sink)
     return emitted
 
 

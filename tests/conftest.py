@@ -172,15 +172,6 @@ def fake_langfuse() -> FakeLangfuse:
     return FakeLangfuse()
 
 
-@pytest.fixture(autouse=True)
-def recorded_ingestion_events(hook_module: Any, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    """Keep the suite hermetic: the post-lock ingestion POST never reaches the
-    network; tests can assert on the recorded span-update/trace-create events."""
-    sent: list[dict[str, Any]] = []
-    monkeypatch.setattr(hook_module, "post_ingestion_events", lambda config, events: sent.extend(events))
-    return sent
-
-
 @pytest.fixture
 def isolated_hook_state(tmp_path: Path, hook_module: Any, monkeypatch: pytest.MonkeyPatch) -> Path:
     state_dir = tmp_path / "claude-state"
