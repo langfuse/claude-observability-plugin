@@ -10,6 +10,7 @@ Claude Code -> Langfuse hook
 
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -1343,18 +1344,22 @@ def derive_turn_trace_id(trace_seed: str, turn_number: int) -> Optional[str]:
     except Exception:
         return None
 
-def _build_forced_trace_context(trace_id_hex: str) -> Optional[Any]:
+def _build_forced_trace_context(trace_id_hex: str,
+                                parent_span_id_hex: Optional[str] = None) -> Optional[Any]:
     """Build an OTel context whose remote parent carries the forced trace id.
 
     A root span started within this context adopts the trace id; its children
-    keep inheriting it as usual. Returns None (caller falls back to an
-    auto-generated id) when the context cannot be built.
+    keep inheriting it as usual. Without parent_span_id_hex the parent gets a
+    phantom span id that never exports (the span becomes the trace's root);
+    with it (attached mode) the span nests under that externally exported
+    span. Returns None (caller falls back to an auto-generated id) when the
+    context cannot be built.
     """
     try:
         trace_id = int(trace_id_hex, 16)
         if trace_id == 0:
             return None
-        span_id = 0
+        span_id = int(parent_span_id_hex, 16) if parent_span_id_hex else 0
         while span_id == 0:
             span_id = random.getrandbits(64)
         parent_span_context = otel_trace_api.SpanContext(
@@ -1371,9 +1376,10 @@ def _build_forced_trace_context(trace_id_hex: str) -> Optional[Any]:
         return None
 
 def _start_root_otel_span(langfuse: Langfuse, name: str, start_ns: Optional[int],
-                          forced_trace_id: Optional[str]) -> Any:
+                          forced_trace_id: Optional[str],
+                          forced_parent_span_id: Optional[str] = None) -> Any:
     if forced_trace_id:
-        context = _build_forced_trace_context(forced_trace_id)
+        context = _build_forced_trace_context(forced_trace_id, forced_parent_span_id)
         if context is not None:
             try:
                 return langfuse._otel_tracer.start_span(name=name, start_time=start_ns, context=context)
@@ -1386,6 +1392,7 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
                      parent_otel_span: Any = None,
                      as_root: bool = False,
                      forced_trace_id: Optional[str] = None,
+                     forced_parent_span_id: Optional[str] = None,
                      **obs_kwargs: Any) -> Any:
     """Create a Langfuse observation with an explicit OTel start_time.
 
@@ -1413,7 +1420,7 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
         with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
             otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
     else:
-        otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id)
+        otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id, forced_parent_span_id)
     if as_root:
         # SDK/server contract: spans under a synthetic trace-id carrier have a
         # parentSpanId that never exports, so the server only treats them as
@@ -2250,20 +2257,40 @@ def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
 
 
 def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
-                        transcript_path: Path, trace_seed: Optional[str] = None) -> Any:
+                        transcript_path: Path, trace_seed: Optional[str] = None,
+                        parent_context: Optional[Tuple[str, str]] = None) -> Any:
     """Open the turn's root span, backdated to the user message.
 
     The root exports exactly once, at the first firing that is allowed to
     emit the turn (async activity resolved, or turn closed); later firings
     only attach children under it via the remote-parent carrier.
 
-    With trace_seed set (CC_LANGFUSE_TRACE_SEED) the root adopts the
-    externally precomputable trace id derived from seed and turn number;
-    otherwise the session:user-row-uuid carrier pins the trace id.
+    With parent_context set (attached mode: an externally provided
+    trace id + span id), the turn joins the launching application's trace
+    and nests under that span — the application owns the trace root, so no
+    as_root marker is set. Otherwise, with trace_seed set
+    (CC_LANGFUSE_TRACE_SEED) the root adopts the externally precomputable
+    trace id derived from seed and turn number; otherwise the
+    session:user-row-uuid carrier pins the trace id.
     """
     user_text_raw = extract_text_from_content(get_content_from_row(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
     trace_metadata = build_trace_metadata(session_id, turn_num, turn, transcript_path, user_text_meta)
+    if parent_context is not None:
+        parent_trace_id, parent_span_id = parent_context
+        trace_metadata["parent_trace_id"] = parent_trace_id
+        trace_metadata["parent_span_id"] = parent_span_id
+        return _start_backdated(
+            langfuse,
+            name="Conversational Turn",
+            as_type="span",
+            start_time=parse_timestamp(turn.user_msg),
+            forced_trace_id=parent_trace_id,
+            forced_parent_span_id=parent_span_id,
+            as_root=False,
+            input={"role": "user", "content": user_text},
+            metadata=trace_metadata,
+        )
     # Opt-in deterministic trace ids: fail open to the carrier-derived id.
     forced_trace_id: Optional[str] = None
     if trace_seed:
@@ -2306,7 +2333,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
               subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
               progress: Optional[Dict[str, Any]] = None,
               close: bool = True,
-              trace_seed: Optional[str] = None) -> Dict[str, Any]:
+              trace_seed: Optional[str] = None,
+              parent_context: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
     """Emit a turn, resuming from prior firings' progress.
 
     With no progress and close=True this is the classic one-shot emission.
@@ -2324,17 +2352,25 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         emitted=set(k for k in (progress.get("emitted_keys") or []) if isinstance(k, str)),
         completed_only=not close,
     )
-    with propagate_attributes(
-        session_id=session_id,
-        user_id=user_id,
-        trace_name=trace_display_name(session_id, turn_num),
-        tags=get_trace_tags(turn, subagent_transcripts_by_tool_use_id),
-    ):
+    if parent_context is None:
+        attribute_propagation = propagate_attributes(
+            session_id=session_id,
+            user_id=user_id,
+            trace_name=trace_display_name(session_id, turn_num),
+            tags=get_trace_tags(turn, subagent_transcripts_by_tool_use_id),
+        )
+    else:
+        # Attached mode: trace name, session, user and tags are trace-level
+        # fields owned by the launching application's trace — propagating
+        # them would overwrite the application's own values server-side.
+        attribute_propagation = contextlib.nullcontext()
+    with attribute_propagation:
         trace_span = None
         root_span_id = progress.get("root_span_id")
         if not is_valid_span_id_hex(root_span_id):
             trace_span = open_turn_root_span(
-                langfuse, session_id, turn_num, turn, transcript_path, trace_seed=trace_seed
+                langfuse, session_id, turn_num, turn, transcript_path,
+                trace_seed=trace_seed, parent_context=parent_context,
             )
             root_span_id = getattr(trace_span, "id", None)
             progress["root_span_id"] = root_span_id
@@ -2343,10 +2379,11 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         else:
             # Root span exported by an earlier firing: attach children to it
             # via a carrier. The stored trace id wins over re-derivation so
-            # seeded turns resume into the same trace.
+            # seeded and attached turns resume into the same trace.
             parent_otel_span = remote_parent(
                 langfuse, session_id, turn.user_msg.get("uuid"),
-                root_span_id=root_span_id, trace_id=progress.get("trace_id"),
+                root_span_id=root_span_id,
+                trace_id=progress.get("trace_id") or (parent_context[0] if parent_context else None),
             )
         obs_end_ts = emit_turn_observations(
             langfuse,
@@ -2386,6 +2423,7 @@ def emit_and_close_ready_turns(
     user_id: Optional[str],
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
     trace_seed: Optional[str] = None,
+    parent_context: Optional[Tuple[str, str]] = None,
 ) -> int:
     emitted = 0
     # Turns without a user-row uuid bypass assign_turn_numbers; seed their
@@ -2415,6 +2453,7 @@ def emit_and_close_ready_turns(
                 progress=progress,
                 close=True,
                 trace_seed=trace_seed,
+                parent_context=parent_context,
             )
         except Exception as e:
             # Log at INFO so SDK incompatibilities (and other emit failures)
@@ -2433,6 +2472,7 @@ def emit_ready_observations_of_open_turn(
     user_id: Optional[str],
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
     trace_seed: Optional[str] = None,
+    parent_context: Optional[Tuple[str, str]] = None,
 ) -> None:
     """Emit the held open turn once its async activity is provably resolved.
 
@@ -2475,6 +2515,7 @@ def emit_ready_observations_of_open_turn(
             progress=progress if isinstance(progress, dict) else None,
             close=False,
             trace_seed=trace_seed,
+            parent_context=parent_context,
         )
         session_state.turn_progress[user_row_uuid] = progress
     except Exception as e:
@@ -2520,6 +2561,7 @@ def emit_new_turns_from_transcript(
                 user_id=config.user_id,
                 subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
                 trace_seed=config.trace_seed,
+                parent_context=config.parent_context,
             )
 
         session_state.turn_count += emitted
@@ -2536,6 +2578,7 @@ def emit_new_turns_from_transcript(
             user_id=config.user_id,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
             trace_seed=config.trace_seed,
+            parent_context=config.parent_context,
         )
 
         # Known limitation (accepted, like the crash-between-emit-and-save
