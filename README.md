@@ -42,6 +42,8 @@ The plugin requires or accepts:
 | `CC_LANGFUSE_SKILL_TAGS` | Tag traces with `skill:<name>` for every skill invoked in the turn (default true).                 |
 | `CC_LANGFUSE_CAPTURE_SKILL_CONTENT` | Include injected skill instruction text in the Skill tool span output (default false).  |
 | `CC_LANGFUSE_TRACE_SEED` | Optional. Opt-in seed for deterministic trace IDs — see [Deterministic trace IDs](#deterministic-trace-ids). |
+| `CC_LANGFUSE_TRACEPARENT` | Optional, per run (env var, not plugin config). W3C traceparent of an existing trace to attach to — see [Attach runs to an existing trace](#attach-runs-to-an-existing-trace). |
+| `CC_LANGFUSE_PARENT_TRACE_ID` / `CC_LANGFUSE_PARENT_SPAN_ID` | Optional, per run. Explicit alternative to `CC_LANGFUSE_TRACEPARENT` (32-hex trace id + 16-hex span id). |
 
 Get keys from your Langfuse project settings → API Keys.
 
@@ -130,6 +132,33 @@ subprocess.run(
 
 If derivation or wiring fails for any reason, the hook falls back to an auto-generated
 trace ID (fail-open, like the rest of the hook). Unset or empty seed = unchanged behavior.
+
+## Attach runs to an existing trace
+
+When your application launches Claude Code headlessly (`claude -p`) as one step of a
+larger, already-instrumented workflow, the agent run can join your application's
+existing Langfuse trace instead of creating separate root traces. Create a span for
+the agent run in your application (this becomes the run-level node), then pass its
+trace context as environment variables when launching Claude Code:
+
+```python
+from langfuse import get_client
+
+langfuse = get_client()
+
+with langfuse.start_as_current_span(name="Claude Code run") as run_span:
+    traceparent = f"00-{run_span.trace_id}-{run_span.id}-01"
+    subprocess.run(
+        ["claude", "-p", "Refactor utils.py"],
+        env={**os.environ, "CC_LANGFUSE_TRACEPARENT": traceparent},
+    )
+```
+
+Every conversational turn of the session (with its LLM calls, tool calls, and
+subagents) then appears as a child of your `Claude Code run` span, in your trace.
+Instead of `CC_LANGFUSE_TRACEPARENT` you can pass `CC_LANGFUSE_PARENT_TRACE_ID` and
+`CC_LANGFUSE_PARENT_SPAN_ID` explicitly.
+
 
 ## Privacy
 
