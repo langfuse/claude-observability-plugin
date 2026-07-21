@@ -454,6 +454,19 @@ def get_usage_details_from_row(row: Dict[str, Any]) -> Optional[Dict[str, int]]:
             details[dst] = v
     return details or None
 
+def get_speed_from_row(row: Dict[str, Any]) -> Optional[str]:
+    """Extract the Anthropic request speed ("standard"/"fast") from an assistant message."""
+    m = row.get("message")
+    if not isinstance(m, dict):
+        return None
+    u = m.get("usage")
+    if not isinstance(u, dict):
+        return None
+    speed = u.get("speed")
+    if isinstance(speed, str) and speed:
+        return speed
+    return None
+
 def parse_timestamp(value: Any) -> Optional[datetime]:
     """Parse a Claude Code jsonl row timestamp (ISO 8601 with trailing Z)."""
     if isinstance(value, dict):
@@ -1832,6 +1845,8 @@ def build_generation_kwargs(
     assistant_text, assistant_text_meta = truncate_text(assistant_text_raw)
     tool_uses = get_tool_use_blocks(get_content_from_row(assistant_message))
 
+    speed = get_speed_from_row(assistant_message)
+
     generation_kwargs: Dict[str, Any] = dict(
         model=get_model(assistant_message),
         input=build_generation_input(
@@ -1847,6 +1862,8 @@ def build_generation_kwargs(
             "tool_count": len(tool_uses),
         },
     )
+    if speed is not None:
+        generation_kwargs["metadata"]["speed"] = speed
     usage_details = get_usage_details_from_row(assistant_message)
     if usage_details is not None:
         generation_kwargs["usage_details"] = usage_details
