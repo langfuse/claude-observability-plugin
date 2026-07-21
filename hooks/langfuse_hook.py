@@ -55,6 +55,64 @@ class LangfuseConfig:
     host: str
     user_id: Optional[str]
     trace_seed: Optional[str] = None
+    parent_trace_id: Optional[str] = None
+    parent_span_id: Optional[str] = None
+
+    @property
+    def parent_context(self) -> Optional[Tuple[str, str]]:
+        """(trace_id, span_id) of an externally provided parent, if any."""
+        if self.parent_trace_id and self.parent_span_id:
+            return (self.parent_trace_id, self.parent_span_id)
+        return None
+
+def parse_traceparent(value: str) -> Optional[Tuple[str, str]]:
+    """Parse a W3C traceparent string into (trace_id, span_id).
+
+    Accepts the version-00 format `00-<32 hex trace id>-<16 hex span id>-<flags>`
+    (https://www.w3.org/TR/trace-context/). All-zero ids are invalid per spec.
+    The flags field is ignored (tolerant reader): the hook only needs the ids.
+    """
+    parts = value.strip().lower().split("-")
+    if len(parts) != 4:
+        return None
+    version, trace_id, span_id, _flags = parts
+    if version != "00":
+        return None
+    if not _is_valid_trace_id_hex(trace_id):
+        return None
+    if not is_valid_span_id_hex(span_id) or int(span_id, 16) == 0:
+        return None
+    return trace_id, span_id
+
+def get_parent_trace_context_from_env() -> Tuple[Optional[str], Optional[str]]:
+    """Read the opt-in parent trace context ("attached mode") from the env.
+
+    CC_LANGFUSE_TRACEPARENT (W3C format) wins over the explicit id pair.
+    Deliberately namespaced — bare TRACEPARENT is NOT read, because Claude
+    Code's native OTel telemetry injects TRACEPARENT into subprocess
+    environments and would silently reparent every trace.
+    """
+    traceparent = _opt("CC_LANGFUSE_TRACEPARENT")
+    if traceparent:
+        parsed = parse_traceparent(traceparent)
+        if parsed is not None:
+            return parsed
+        info(f"Ignoring malformed CC_LANGFUSE_TRACEPARENT {traceparent!r}")
+    parent_trace_id = _opt("CC_LANGFUSE_PARENT_TRACE_ID").strip().lower() or None
+    parent_span_id = _opt("CC_LANGFUSE_PARENT_SPAN_ID").strip().lower() or None
+    if parent_trace_id is None and parent_span_id is None:
+        return None, None
+    if (
+        not _is_valid_trace_id_hex(parent_trace_id)
+        or not is_valid_span_id_hex(parent_span_id)
+        or int(parent_span_id, 16) == 0
+    ):
+        info(
+            "Ignoring parent trace context: CC_LANGFUSE_PARENT_TRACE_ID and "
+            "CC_LANGFUSE_PARENT_SPAN_ID must both be valid non-zero hex ids"
+        )
+        return None, None
+    return parent_trace_id, parent_span_id
 
 def get_langfuse_config() -> Optional[LangfuseConfig]:
     public_key = _opt("LANGFUSE_PUBLIC_KEY") or _opt("CC_LANGFUSE_PUBLIC_KEY")
@@ -62,6 +120,12 @@ def get_langfuse_config() -> Optional[LangfuseConfig]:
     host = _opt("LANGFUSE_BASE_URL") or _opt("CC_LANGFUSE_BASE_URL") or "https://us.cloud.langfuse.com"
     user_id = _opt("LANGFUSE_USER_ID") or _opt("CC_LANGFUSE_USER_ID") or None
     trace_seed = _opt("CC_LANGFUSE_TRACE_SEED") or None
+    parent_trace_id, parent_span_id = get_parent_trace_context_from_env()
+    if parent_trace_id is not None and trace_seed is not None:
+        # Both features pin the root's trace id; the externally provided
+        # parent wins because it also carries the nesting intent.
+        info("CC_LANGFUSE_TRACE_SEED ignored: parent trace context takes precedence")
+        trace_seed = None
 
     if not public_key or not secret_key:
         return None
@@ -72,6 +136,8 @@ def get_langfuse_config() -> Optional[LangfuseConfig]:
         host=host,
         user_id=user_id,
         trace_seed=trace_seed,
+        parent_trace_id=parent_trace_id,
+        parent_span_id=parent_span_id,
     )
 
 def _missing_langfuse_keys() -> List[str]:
