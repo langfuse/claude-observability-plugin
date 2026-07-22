@@ -25,14 +25,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# ----------------- Langfuse import (fail-open) -----------------
-try:
-    from langfuse import Langfuse, propagate_attributes
-    from opentelemetry import trace as otel_trace_api
-except Exception:
-    sys.exit(0)
-
-
 # ----------------- Paths -----------------
 STATE_DIR = Path.home() / ".claude" / "state"
 LOG_FILE = STATE_DIR / "langfuse_hook.log"
@@ -82,15 +74,34 @@ def get_langfuse_config() -> Optional[LangfuseConfig]:
         trace_seed=trace_seed,
     )
 
-def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
-    try:
-        return Langfuse(
-            public_key=config.public_key,
-            secret_key=config.secret_key,
-            host=config.host,
+def _missing_langfuse_keys() -> List[str]:
+    missing = []
+    if not (_opt("LANGFUSE_PUBLIC_KEY") or _opt("CC_LANGFUSE_PUBLIC_KEY")):
+        missing.append("LANGFUSE_PUBLIC_KEY")
+    if not (_opt("LANGFUSE_SECRET_KEY") or _opt("CC_LANGFUSE_SECRET_KEY")):
+        missing.append("LANGFUSE_SECRET_KEY")
+    return missing
+
+def _plugin_load_identity() -> str:
+    # CLAUDE_PLUGIN_DATA ends in "<plugin-name>-<identity>", so the identity this
+    # hook was loaded under is directly observable; empty when undeterminable.
+    base = Path(os.environ.get("CLAUDE_PLUGIN_DATA", "")).name
+    prefix = "langfuse-observability-"
+    return base[len(prefix):] if base.startswith(prefix) else ""
+
+def log_missing_langfuse_config() -> None:
+    missing = ", ".join(_missing_langfuse_keys()) or "unknown keys"
+    msg = (
+        f"Langfuse config incomplete: missing {missing} "
+        "(checked CLAUDE_PLUGIN_OPTION_* and plain env vars); tracing disabled for this turn."
+    )
+    identity = _plugin_load_identity()
+    if identity and identity != "langfuse-observability":
+        msg += (
+            f" Note: this hook was loaded under plugin identity '@{identity}'; options configured "
+            "under '@langfuse-observability' are not delivered to it."
         )
-    except Exception:
-        return None
+    info(msg)
 
 
 # ----------------- Logging -----------------
@@ -133,6 +144,35 @@ def info(msg: str) -> None:
             lg.info(msg)
         except Exception:
             pass
+
+
+# ----------------- Langfuse import (fail-open) -----------------
+# Everything above this guard runs before the SDK import and must stay
+# stdlib-only and parseable on Python 3.9 so this failure path can log.
+try:
+    from langfuse import Langfuse, propagate_attributes
+    from opentelemetry import trace as otel_trace_api
+except Exception as e:
+    info(
+        f"langfuse import failed ({type(e).__name__}: {e}); "
+        f"python={sys.version.split()[0]} executable={sys.executable} "
+        f"PATH={os.environ.get('PATH', '')}. "
+        "Hint: uv was not found on this PATH. If uv is installed, check that its "
+        "location is on the PATH seen by the app that launches Claude Code; "
+        "GUI apps often use a minimal PATH."
+    )
+    sys.exit(0)
+
+def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
+    try:
+        return Langfuse(
+            public_key=config.public_key,
+            secret_key=config.secret_key,
+            host=config.host,
+        )
+    except Exception as e:
+        info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
+        return None
 
 
 # ----------------- Hook payload -----------------
