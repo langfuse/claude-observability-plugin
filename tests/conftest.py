@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import importlib.util
 import json
+import logging
 import sys
 import types
 from pathlib import Path
@@ -154,11 +155,29 @@ def fake_langfuse() -> FakeLangfuse:
     return FakeLangfuse()
 
 
-@pytest.fixture
-def isolated_hook_state(tmp_path: Path, hook_module: Any, monkeypatch: pytest.MonkeyPatch) -> Path:
+def _reset_hook_logger(hook_module: Any) -> None:
+    # The logger is cached twice (hook module global + Python's process-global
+    # registry), so a handler bound to a stale log path would survive across tests.
+    hook_module._logger = None
+    logger = logging.getLogger("langfuse_hook")
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        with contextlib.suppress(Exception):
+            handler.close()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hook_env(tmp_path: Path, hook_module: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     state_dir = tmp_path / "claude-state"
     monkeypatch.setattr(hook_module, "STATE_DIR", state_dir)
     monkeypatch.setattr(hook_module, "STATE_FILE", state_dir / "langfuse_state.json")
     monkeypatch.setattr(hook_module, "LOCK_FILE", state_dir / "langfuse_state.lock")
     monkeypatch.setattr(hook_module, "LOG_FILE", state_dir / "langfuse_hook.log")
-    return state_dir
+    _reset_hook_logger(hook_module)
+    yield state_dir
+    _reset_hook_logger(hook_module)
+
+
+@pytest.fixture
+def isolated_hook_state(_isolated_hook_env: Path) -> Path:
+    return _isolated_hook_env
