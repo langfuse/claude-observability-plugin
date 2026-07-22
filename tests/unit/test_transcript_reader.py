@@ -50,8 +50,16 @@ def test_read_new_jsonl_restarts_when_file_shrinks(hook_module, tmp_path):
     state = hook_module.SessionState()
     rows, state = hook_module.read_new_jsonl(transcript, state)
     assert rows == [first]
+    state.open_turn_rows = [first]
+    state.pending_agent_turns = [{"rows": [first]}]
+    state.pending_task_notifications = [first]
+    state.pending_task_notification_contexts = [{"insert_after_uuid": "old"}]
 
     transcript.write_text(json.dumps(second) + "\n", encoding="utf-8")
     rows, state = hook_module.read_new_jsonl(transcript, state)
     assert rows == [second]
     assert state.offset == transcript.stat().st_size
+    assert state.open_turn_rows == []
+    assert state.pending_agent_turns == []
+    assert state.pending_task_notifications == []
+    assert state.pending_task_notification_contexts == []

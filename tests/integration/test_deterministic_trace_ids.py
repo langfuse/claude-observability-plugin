@@ -81,7 +81,11 @@ def test_seeded_turns_get_individually_predictable_trace_ids(
     )
 
     emitted = hook_module.emit_new_turns_from_transcript(
-        fake_langfuse, config, "session-seeded", transcript
+        fake_langfuse,
+        config,
+        "session-seeded",
+        transcript,
+        flush_deferred_agent_turns=True,
     )
 
     assert emitted == 2
@@ -115,7 +119,13 @@ def test_turn_numbers_continue_across_hook_runs(
         "public", "secret", "https://example.test", "user-1", trace_seed=seed
     )
 
-    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-seeded", transcript)
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse,
+        config,
+        "session-seeded",
+        transcript,
+        flush_deferred_agent_turns=True,
+    )
 
     # Append a third turn and run the hook again: it must derive from the
     # persisted turn_count, not restart at 1.
@@ -141,7 +151,11 @@ def test_turn_numbers_continue_across_hook_runs(
         }) + "\n")
 
     emitted = hook_module.emit_new_turns_from_transcript(
-        fake_langfuse, config, "session-seeded", transcript
+        fake_langfuse,
+        config,
+        "session-seeded",
+        transcript,
+        flush_deferred_agent_turns=True,
     )
 
     assert emitted == 1
@@ -155,7 +169,11 @@ def test_without_seed_trace_ids_stay_auto_generated(
     config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
 
     emitted = hook_module.emit_new_turns_from_transcript(
-        fake_langfuse, config, "session-seeded", transcript
+        fake_langfuse,
+        config,
+        "session-seeded",
+        transcript,
+        flush_deferred_agent_turns=True,
     )
 
     assert emitted == 2
@@ -177,7 +195,11 @@ def test_derivation_failure_falls_back_to_auto_generated_trace_id(
     monkeypatch.setattr(hook_module, "derive_turn_trace_id", _boom)
 
     emitted = hook_module.emit_new_turns_from_transcript(
-        fake_langfuse, config, "session-seeded", transcript
+        fake_langfuse,
+        config,
+        "session-seeded",
+        transcript,
+        flush_deferred_agent_turns=True,
     )
 
     assert emitted == 2
@@ -201,7 +223,11 @@ def test_forced_context_failure_falls_back_to_auto_generated_trace_id(
     monkeypatch.setattr(hook_module.otel_trace_api, "SpanContext", _boom)
 
     emitted = hook_module.emit_new_turns_from_transcript(
-        fake_langfuse, config, "session-seeded", transcript
+        fake_langfuse,
+        config,
+        "session-seeded",
+        transcript,
+        flush_deferred_agent_turns=True,
     )
 
     assert emitted == 2

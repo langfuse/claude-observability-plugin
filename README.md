@@ -55,7 +55,7 @@ If neither is set up, the hook exits silently — no impact on Claude Code.
 
 ## How it works
 
-A hook reads the session transcript incrementally on every turn (Stop) and at session end (SessionEnd), and emits a Langfuse trace with one span per turn, nested generations per assistant message, and child tool spans for every tool call. Token usage is captured when present.
+A hook reads the session transcript incrementally on every `Stop` event and at session end (`SessionEnd`), and emits a Langfuse trace with one span per turn, nested generations per assistant message, and child tool spans for every tool call. Token usage is captured when present. A logical turn may span multiple `Stop` events; incomplete turns are retained across hook runs and emitted when closed or when the session ends.
 
 The plugin observes only data that Claude Code exposes through hooks and transcript files.
 

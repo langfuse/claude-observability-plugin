@@ -271,25 +271,39 @@ class SessionState:
     offset: int = 0       # Last byte read from the transcript file.
     buffer: str = ""      # Partial JSONL line kept between hook runs.
     turn_count: int = 0   # Turns already emitted for this session.
+    # Raw rows for the trailing logical turn, which may span multiple Stop
+    # hook invocations before the next real user message closes it.
+    open_turn_rows: List[Dict[str, Any]] = field(default_factory=list)
     pending_agent_turns: List[Dict[str, Any]] = field(default_factory=list)
     # Task-notification rows whose tool_use_id could not be resolved yet
     # (task-id-only and the subagent meta.json not on disk); retried each run.
     pending_task_notifications: List[Dict[str, Any]] = field(default_factory=list)
+    # Positional anchors parallel to pending_task_notifications, used to put a
+    # resolved row back in its original place without contaminating another turn.
+    pending_task_notification_contexts: List[Dict[str, Any]] = field(default_factory=list)
 
 def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
+    open_turn_rows = s.get("open_turn_rows")
+    if not isinstance(open_turn_rows, list):
+        open_turn_rows = []
     pending_agent_turns = s.get("pending_agent_turns")
     if not isinstance(pending_agent_turns, list):
         pending_agent_turns = []
     pending_task_notifications = s.get("pending_task_notifications")
     if not isinstance(pending_task_notifications, list):
         pending_task_notifications = []
+    pending_task_notification_contexts = s.get("pending_task_notification_contexts")
+    if not isinstance(pending_task_notification_contexts, list):
+        pending_task_notification_contexts = []
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
         turn_count=int(s.get("turn_count", 0)),
+        open_turn_rows=open_turn_rows,
         pending_agent_turns=pending_agent_turns,
         pending_task_notifications=pending_task_notifications,
+        pending_task_notification_contexts=pending_task_notification_contexts,
     )
 
 def update_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
@@ -297,8 +311,10 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "offset": session_state.offset,
         "buffer": session_state.buffer,
         "turn_count": session_state.turn_count,
+        "open_turn_rows": session_state.open_turn_rows or [],
         "pending_agent_turns": session_state.pending_agent_turns or [],
         "pending_task_notifications": session_state.pending_task_notifications or [],
+        "pending_task_notification_contexts": session_state.pending_task_notification_contexts or [],
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -463,6 +479,12 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
             debug(f"transcript shrank ({file_size} < {session_state.offset}); restarting")
             session_state.offset = 0
             session_state.buffer = ""
+            # Rows from the old file must not be joined to the replacement
+            # transcript when its first batch is assembled.
+            session_state.open_turn_rows = []
+            session_state.pending_agent_turns = []
+            session_state.pending_task_notifications = []
+            session_state.pending_task_notification_contexts = []
         with open(transcript_path, "rb") as f:
             f.seek(session_state.offset)
             chunk = f.read()
@@ -590,6 +612,84 @@ def _find_pending_agent_turn(
             return pending_turn
     return None
 
+def _get_agent_tool_use_ids_from_row(row: Dict[str, Any]) -> List[str]:
+    tool_use_ids: List[str] = []
+    for tool_use_block in get_tool_use_blocks(get_content_from_row(row)):
+        if tool_use_block.get("name") not in ("Agent", "Task"):
+            continue
+        tool_use_id = str(tool_use_block.get("id") or "")
+        if tool_use_id:
+            tool_use_ids.append(tool_use_id)
+    return tool_use_ids
+
+def _open_turn_owns_agent_tool_use_id(
+    session_state: SessionState,
+    tool_use_id: str,
+) -> bool:
+    """Return whether the persisted open turn launched this Agent/Task.
+
+    A task-id-only notification can arrive before its subagent metadata. When
+    that metadata appears on a later hook run, the notification belongs back
+    in the open turn rather than being dropped for lack of a deferred turn.
+    """
+    for row in session_state.open_turn_rows:
+        if tool_use_id in _get_agent_tool_use_ids_from_row(row):
+            return True
+    return False
+
+def _set_row_reference(
+    context: Dict[str, Any],
+    prefix: str,
+    row: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(row, dict):
+        return
+    row_uuid = row.get("uuid")
+    if isinstance(row_uuid, str) and row_uuid:
+        context[f"{prefix}_uuid"] = row_uuid
+    else:
+        context[f"{prefix}_row"] = row
+
+def _row_matches_reference(
+    row: Dict[str, Any],
+    context: Dict[str, Any],
+    prefix: str,
+) -> bool:
+    referenced_uuid = context.get(f"{prefix}_uuid")
+    if isinstance(referenced_uuid, str) and referenced_uuid:
+        return row.get("uuid") == referenced_uuid
+    referenced_row = context.get(f"{prefix}_row")
+    return isinstance(referenced_row, dict) and row == referenced_row
+
+def _insert_row_at_stashed_position(
+    rows: List[Dict[str, Any]],
+    row: Dict[str, Any],
+    context: Optional[Dict[str, Any]] = None,
+) -> None:
+    if any(existing_row == row for existing_row in rows):
+        return
+
+    position = context if isinstance(context, dict) else {}
+    for index, existing_row in enumerate(rows):
+        if _row_matches_reference(existing_row, position, "insert_before"):
+            rows.insert(index, row)
+            return
+    for index, existing_row in enumerate(rows):
+        if _row_matches_reference(existing_row, position, "insert_after"):
+            rows.insert(index + 1, row)
+            return
+    rows.append(row)
+
+def _row_is_retained_turn_content(row: Dict[str, Any]) -> bool:
+    if row.get("isMeta"):
+        return bool(
+            row.get("sourceToolUseID")
+            and extract_text_from_content(get_content_from_row(row))
+        )
+    if is_tool_result(row):
+        return True
+    return get_user_or_assistant_role_from_row(row) in ("user", "assistant")
+
 def resolve_deferred_agent_turns(
     rows: List[Dict[str, Any]],
     session_state: SessionState,
@@ -606,9 +706,56 @@ def resolve_deferred_agent_turns(
     """
     remaining_rows: List[Dict[str, Any]] = []
     stashed_notifications: List[Dict[str, Any]] = []
+    stashed_notification_contexts: List[Dict[str, Any]] = []
 
-    def route_to_pending_turn(pending_turn: Dict[str, Any], row: Dict[str, Any], tool_use_id: str) -> None:
-        pending_turn["rows"].append(row)
+    # Claude Code can write two representations of one completion (for
+    # example a task-id-only queue row and a user notification carrying both
+    # task-id and tool-use-id). Exact shared task ids provide authoritative
+    # correlation without guessing across parallel agents.
+    tool_use_ids_by_current_task_id: Dict[str, set[str]] = {}
+    for row in rows:
+        if not is_task_notification_row(row):
+            continue
+        task_id = get_task_id_from_task_notification(row)
+        tool_use_id = get_tool_use_id_for_task_notification(
+            row,
+            task_id_to_tool_use_id,
+        )
+        if task_id and tool_use_id:
+            tool_use_ids_by_current_task_id.setdefault(task_id, set()).add(tool_use_id)
+
+    inferred_current_tool_use_ids: Dict[int, str] = {}
+    for row_index, row in enumerate(rows):
+        if not is_task_notification_row(row):
+            continue
+        if get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id):
+            continue
+        task_id = get_task_id_from_task_notification(row)
+        matching_tool_use_ids = tool_use_ids_by_current_task_id.get(task_id or "", set())
+        if len(matching_tool_use_ids) == 1:
+            inferred_current_tool_use_ids[row_index] = next(iter(matching_tool_use_ids))
+
+    inferred_stashed_tool_use_ids: Dict[int, str] = {}
+    for notification_index, notification in enumerate(
+        session_state.pending_task_notifications
+    ):
+        notification_task_id = get_task_id_from_task_notification(notification)
+        matching_tool_use_ids = tool_use_ids_by_current_task_id.get(
+            notification_task_id or "",
+            set(),
+        )
+        if len(matching_tool_use_ids) == 1:
+            inferred_stashed_tool_use_ids[notification_index] = next(
+                iter(matching_tool_use_ids)
+            )
+
+    def route_to_pending_turn(
+        pending_turn: Dict[str, Any],
+        row: Dict[str, Any],
+        tool_use_id: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        _insert_row_at_stashed_position(pending_turn["rows"], row, context)
         pending_tool_use_ids = pending_turn.get("pending_tool_use_ids")
         if isinstance(pending_tool_use_ids, list) and tool_use_id in pending_tool_use_ids:
             pending_tool_use_ids.remove(tool_use_id)
@@ -616,32 +763,153 @@ def resolve_deferred_agent_turns(
 
     # Retry stashed notifications from earlier runs first (they are older than
     # anything in the batch); their task-id may resolve now.
-    for row in session_state.pending_task_notifications:
-        tool_use_id = get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
+    saved_contexts = session_state.pending_task_notification_contexts
+    for index, row in enumerate(session_state.pending_task_notifications):
+        context = (
+            saved_contexts[index]
+            if index < len(saved_contexts) and isinstance(saved_contexts[index], dict)
+            else {}
+        )
+        tool_use_id = (
+            get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
+            or inferred_stashed_tool_use_ids.get(index)
+        )
         if tool_use_id is None:
             stashed_notifications.append(row)
+            stashed_notification_contexts.append(context)
             continue
         pending_turn = _find_pending_agent_turn(session_state, tool_use_id)
         if pending_turn is None:
-            debug(f"Dropping stashed task notification for {tool_use_id}: no deferred turn waits for it")
+            if _open_turn_owns_agent_tool_use_id(session_state, tool_use_id):
+                _insert_row_at_stashed_position(
+                    session_state.open_turn_rows,
+                    row,
+                    context,
+                )
+                continue
+            debug(
+                f"Dropping stashed task notification for {tool_use_id}: "
+                "no deferred or open turn waits for it"
+            )
             continue
-        route_to_pending_turn(pending_turn, row, tool_use_id)
+        route_to_pending_turn(pending_turn, row, tool_use_id, context)
 
-    for row in rows:
+    open_turn_notification_insert_index: Optional[int] = None
+    batch_agent_notification_insert_indices: Dict[str, int] = {}
+    current_batch_turn_agent_tool_use_ids: set[str] = set()
+
+    def insert_notification(index: int, row: Dict[str, Any]) -> None:
+        nonlocal open_turn_notification_insert_index
+        remaining_rows.insert(index, row)
+        if (
+            open_turn_notification_insert_index is not None
+            and open_turn_notification_insert_index >= index
+        ):
+            open_turn_notification_insert_index += 1
+        for owner_tool_use_id, owner_index in list(
+            batch_agent_notification_insert_indices.items()
+        ):
+            if owner_index >= index:
+                batch_agent_notification_insert_indices[owner_tool_use_id] = owner_index + 1
+
+    last_retained_row = (
+        session_state.open_turn_rows[-1]
+        if session_state.open_turn_rows
+        else None
+    )
+    contexts_waiting_for_next_row = [
+        index
+        for index, context in enumerate(stashed_notification_contexts)
+        if not any(key.startswith("insert_before_") for key in context)
+    ]
+
+    for row_index, row in enumerate(rows):
         if not is_task_notification_row(row):
+            if is_turn_start_row(row):
+                boundary_index = len(remaining_rows)
+                if (
+                    session_state.open_turn_rows
+                    and open_turn_notification_insert_index is None
+                ):
+                    open_turn_notification_insert_index = boundary_index
+                for tool_use_id in current_batch_turn_agent_tool_use_ids:
+                    batch_agent_notification_insert_indices[tool_use_id] = boundary_index
+                current_batch_turn_agent_tool_use_ids = set()
             remaining_rows.append(row)
+            current_batch_turn_agent_tool_use_ids.update(
+                _get_agent_tool_use_ids_from_row(row)
+            )
+            if _row_is_retained_turn_content(row):
+                for context_index in contexts_waiting_for_next_row:
+                    _set_row_reference(
+                        stashed_notification_contexts[context_index],
+                        "insert_before",
+                        row,
+                    )
+                contexts_waiting_for_next_row = []
+                last_retained_row = row
             continue
-        tool_use_id = get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
+        previous_retained_row = last_retained_row
+        for context_index in contexts_waiting_for_next_row:
+            _set_row_reference(
+                stashed_notification_contexts[context_index],
+                "insert_before",
+                row,
+            )
+        contexts_waiting_for_next_row = []
+        tool_use_id = (
+            get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
+            or inferred_current_tool_use_ids.get(row_index)
+        )
         if tool_use_id is None:
+            context: Dict[str, Any] = {}
+            _set_row_reference(context, "insert_after", previous_retained_row)
             stashed_notifications.append(row)
+            stashed_notification_contexts.append(context)
+            contexts_waiting_for_next_row.append(
+                len(stashed_notification_contexts) - 1
+            )
+            # A following unresolved notification anchors to this one. When
+            # both later resolve to the same turn, insertion stays stable
+            # rather than reversing notifications that shared the old anchor.
+            last_retained_row = row
             continue
+        last_retained_row = row
         pending_turn = _find_pending_agent_turn(session_state, tool_use_id)
         if pending_turn is None:
-            remaining_rows.append(row)
+            open_turn_owns_tool_use_id = _open_turn_owns_agent_tool_use_id(
+                session_state,
+                tool_use_id,
+            )
+            if (
+                open_turn_notification_insert_index is not None
+                and open_turn_owns_tool_use_id
+            ):
+                insert_notification(open_turn_notification_insert_index, row)
+                continue
+            batch_owner_index = batch_agent_notification_insert_indices.get(tool_use_id)
+            if batch_owner_index is not None:
+                insert_notification(batch_owner_index, row)
+                continue
+            if (
+                open_turn_owns_tool_use_id
+                or tool_use_id in current_batch_turn_agent_tool_use_ids
+            ):
+                remaining_rows.append(row)
+                continue
+            debug(f"Dropping task notification for {tool_use_id}: no turn owns it")
             continue
         route_to_pending_turn(pending_turn, row, tool_use_id)
 
-    session_state.pending_task_notifications = stashed_notifications[-MAX_PENDING_TASK_NOTIFICATIONS:]
+    retained_stashed_pairs = list(
+        zip(stashed_notifications, stashed_notification_contexts)
+    )[-MAX_PENDING_TASK_NOTIFICATIONS:]
+    session_state.pending_task_notifications = [
+        row for row, _ in retained_stashed_pairs
+    ]
+    session_state.pending_task_notification_contexts = [
+        context for _, context in retained_stashed_pairs
+    ]
 
     # Pop fully resolved turns in deferral (i.e. chronological) order.
     resolved_turn_row_lists: List[List[Dict[str, Any]]] = []
@@ -895,17 +1163,18 @@ def add_assistant_row(row: Dict[str, Any], state: TurnAssemblyState) -> None:
     state.current_rows.append(row)
 
 
-def build_turns(
+def is_turn_start_row(row: Dict[str, Any]) -> bool:
+    """Return whether a row starts a new conversational turn."""
+    if row.get("isMeta") or is_tool_result(row) or is_task_notification_row(row):
+        return False
+    return get_user_or_assistant_role_from_row(row) == "user"
+
+
+def assemble_closed_turns(
     rows: List[Dict[str, Any]],
     task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
-) -> List[Turn]:
-    """
-    Groups incremental transcript rows into turns:
-    user (non-tool-result) -> assistant messages -> (tool_result rows, possibly interleaved)
-    Uses:
-    - assistant rows merged by message.id (all content blocks concatenated)
-    - tool results dedupe by tool_use_id (latest wins)
-    """
+) -> Tuple[List[Turn], TurnAssemblyState]:
+    """Assemble turns closed by a later user row and retain the trailing state."""
     turns: List[Turn] = []
     state = TurnAssemblyState()
 
@@ -935,9 +1204,28 @@ def build_turns(
 
         # ignore unknown rows
 
-    turn = build_turn_from_state(state)
-    if turn is not None:
-        turns.append(turn)
+    return turns, state
+
+
+def build_turns(
+    rows: List[Dict[str, Any]],
+    task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+) -> List[Turn]:
+    """
+    Groups a complete transcript row list into turns:
+    user (non-tool-result) -> assistant messages -> (tool_result rows, possibly interleaved)
+    Uses:
+    - assistant rows merged by message.id (all content blocks concatenated)
+    - tool results dedupe by tool_use_id (latest wins)
+
+    Incremental callers use assemble_closed_turns so the trailing logical turn
+    can remain open across Stop hook invocations. Full-transcript callers keep
+    the historical behavior here and receive that trailing turn immediately.
+    """
+    turns, state = assemble_closed_turns(rows, task_id_to_tool_use_id)
+    trailing_turn = build_turn_from_state(state)
+    if trailing_turn is not None:
+        turns.append(trailing_turn)
     return turns
 
 
@@ -959,18 +1247,40 @@ def get_new_turns_from_transcript(
             debug(f"Flushing {len(flushed_row_lists)} deferred agent turn(s) without task notification")
             deferred_turn_row_lists = deferred_turn_row_lists + flushed_row_lists
 
-    if flush_deferred_agent_turns and session_state.pending_task_notifications:
-        debug(f"Dropping {len(session_state.pending_task_notifications)} unresolved task notification(s) at session end")
+    if flush_deferred_agent_turns:
+        if session_state.pending_task_notifications:
+            debug(f"Dropping {len(session_state.pending_task_notifications)} unresolved task notification(s) at session end")
         session_state.pending_task_notifications = []
+        session_state.pending_task_notification_contexts = []
 
-    # Each deferred row list is a complete turn from an earlier hook run, so
-    # it is rebuilt in isolation and emitted before the current batch (its
-    # rows are always chronologically older than anything in the batch).
+    # Closed deferred turns remain isolated and precede the current/open turn
+    # chronologically.
     turns: List[Turn] = []
     for deferred_turn_rows in deferred_turn_row_lists:
         turns.extend(build_turns(deferred_turn_rows, task_id_to_tool_use_id))
-    if rows:
-        turns.extend(build_turns(rows, task_id_to_tool_use_id))
+
+    combined_rows = (
+        list(session_state.open_turn_rows)
+        + rows
+    )
+    closed_turns, trailing_state = assemble_closed_turns(
+        combined_rows,
+        task_id_to_tool_use_id,
+    )
+    turns.extend(closed_turns)
+
+    if flush_deferred_agent_turns:
+        trailing_turn = build_turn_from_state(trailing_state)
+        if trailing_turn is not None:
+            turns.append(trailing_turn)
+        session_state.open_turn_rows = []
+    elif trailing_state.current_turn_user_row is not None:
+        # Replace rather than append: current_rows already includes every raw
+        # row replayed from the previous state, so appending would duplicate
+        # content on every Stop firing.
+        session_state.open_turn_rows = list(trailing_state.current_rows)
+    else:
+        session_state.open_turn_rows = []
 
     return turns, session_state
 
