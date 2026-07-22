@@ -84,7 +84,9 @@ def test_seeded_turns_get_individually_predictable_trace_ids(
         fake_langfuse, config, "session-seeded", transcript
     )
 
-    assert emitted == 2
+    # The trailing turn has no later user row, so it stays open and is not
+    # counted as emitted; its root span is already opened provisionally.
+    assert emitted == 1
     roots = get_root_observations(fake_langfuse)
     assert len(roots) == 2
     first_id, second_id = (get_forced_trace_id(root) for root in roots)
@@ -158,7 +160,9 @@ def test_without_seed_trace_ids_stay_auto_generated(
         fake_langfuse, config, "session-seeded", transcript
     )
 
-    assert emitted == 2
+    # The trailing turn has no later user row, so it stays open and is not
+    # counted as emitted; its root span is already opened provisionally.
+    assert emitted == 1
     for root in get_root_observations(fake_langfuse):
         assert root._otel_span.context is None
 
@@ -180,7 +184,9 @@ def test_derivation_failure_falls_back_to_auto_generated_trace_id(
         fake_langfuse, config, "session-seeded", transcript
     )
 
-    assert emitted == 2
+    # The trailing turn has no later user row, so it stays open and is not
+    # counted as emitted; its root span is already opened provisionally.
+    assert emitted == 1
     roots = get_root_observations(fake_langfuse)
     assert len(roots) == 2
     for root in roots:
@@ -204,6 +210,26 @@ def test_forced_context_failure_falls_back_to_auto_generated_trace_id(
         fake_langfuse, config, "session-seeded", transcript
     )
 
-    assert emitted == 2
+    # The trailing turn has no later user row, so it stays open and is not
+    # counted as emitted; its root span is already opened provisionally.
+    assert emitted == 1
     for root in get_root_observations(fake_langfuse):
         assert root._otel_span.context is None
+
+
+def test_seeded_open_turn_resumes_without_reopening_its_root(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path
+):
+    """The trailing turn's provisional root must be opened exactly once even
+    with a trace seed: later firings resume via the stored root span id."""
+    transcript = write_two_turn_transcript(tmp_path)
+    config = hook_module.LangfuseConfig(
+        "public", "secret", "https://example.test", "user-1", trace_seed="session-abc"
+    )
+
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-seeded", transcript)
+    roots_after_first_firing = len(get_root_observations(fake_langfuse))
+
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-seeded", transcript)
+
+    assert len(get_root_observations(fake_langfuse)) == roots_after_first_firing

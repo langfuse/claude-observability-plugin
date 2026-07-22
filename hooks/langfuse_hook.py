@@ -315,6 +315,17 @@ class SessionState:
     # Task-notification rows whose tool_use_id could not be resolved yet
     # (task-id-only and the subagent meta.json not on disk); retried each run.
     pending_task_notifications: List[Dict[str, Any]] = field(default_factory=list)
+    # Trailing turn kept while it may still continue; see build_open_turn
+    # for the structure (rows plus emission cursor).
+    open_turn: Dict[str, Any] = field(default_factory=dict)
+    # Turn numbers assigned when a turn is first seen (keyed by its user-row
+    # uuid), so a turn keeps its number regardless of when it is emitted.
+    turn_numbers: Dict[str, int] = field(default_factory=dict)
+    # Per-turn emission progress (keyed by user-row uuid): trace_id,
+    # root_span_id and the keys of already-emitted observations. Carries a
+    # partially emitted turn across firings and across the open -> closed ->
+    # deferred transitions; entries are dropped once the turn is finalized.
+    turn_progress: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
@@ -324,12 +335,24 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     pending_task_notifications = s.get("pending_task_notifications")
     if not isinstance(pending_task_notifications, list):
         pending_task_notifications = []
+    open_turn = s.get("open_turn")
+    if not isinstance(open_turn, dict):
+        open_turn = {}
+    turn_numbers = s.get("turn_numbers")
+    if not isinstance(turn_numbers, dict):
+        turn_numbers = {}
+    turn_progress = s.get("turn_progress")
+    if not isinstance(turn_progress, dict):
+        turn_progress = {}
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
         turn_count=int(s.get("turn_count", 0)),
         pending_agent_turns=pending_agent_turns,
         pending_task_notifications=pending_task_notifications,
+        open_turn=open_turn,
+        turn_numbers=turn_numbers,
+        turn_progress=turn_progress,
     )
 
 def update_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
@@ -339,6 +362,9 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "turn_count": session_state.turn_count,
         "pending_agent_turns": session_state.pending_agent_turns or [],
         "pending_task_notifications": session_state.pending_task_notifications or [],
+        "open_turn": session_state.open_turn or {},
+        "turn_numbers": session_state.turn_numbers or {},
+        "turn_progress": session_state.turn_progress or {},
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -503,6 +529,17 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
             debug(f"transcript shrank ({file_size} < {session_state.offset}); restarting")
             session_state.offset = 0
             session_state.buffer = ""
+            # The held rows refer to the replaced file; re-reading from byte 0
+            # would emit those turns a second time (and mix old rows into the
+            # new stream), so drop all persisted turn state along with the offset.
+            session_state.pending_agent_turns = []
+            session_state.pending_task_notifications = []
+            session_state.open_turn = {}
+            session_state.turn_numbers = {}
+            # Known limitation: rotation drops emission progress, so re-read
+            # turns re-emit from scratch; an already-exported root keeps the
+            # output/end time it was emitted with.
+            session_state.turn_progress = {}
         with open(transcript_path, "rb") as f:
             f.seek(session_state.offset)
             chunk = f.read()
@@ -655,15 +692,15 @@ def resolve_deferred_agent_turns(
             pending_turn.setdefault("resolved_tool_use_ids", []).append(tool_use_id)
 
     # Retry stashed notifications from earlier runs first (they are older than
-    # anything in the batch); their task-id may resolve now.
+    # anything in the batch); their task-id may resolve now. Entries matching
+    # no deferred turn stay stashed: their owning turn may still be open and
+    # only defer once a new user row closes it. Leftovers are cleared at
+    # session end and the stash is size-capped.
     for row in session_state.pending_task_notifications:
         tool_use_id = get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
-        if tool_use_id is None:
-            stashed_notifications.append(row)
-            continue
-        pending_turn = _find_pending_agent_turn(session_state, tool_use_id)
+        pending_turn = _find_pending_agent_turn(session_state, tool_use_id) if tool_use_id else None
         if pending_turn is None:
-            debug(f"Dropping stashed task notification for {tool_use_id}: no deferred turn waits for it")
+            stashed_notifications.append(row)
             continue
         route_to_pending_turn(pending_turn, row, tool_use_id)
 
@@ -766,6 +803,44 @@ def get_pending_agent_tool_use_ids(turn: Turn) -> List[str]:
                 tool_use_ids.append(tool_use_id)
     return tool_use_ids
 
+
+def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[str]:
+    """Tool-use ids of task notifications that were enqueued (queue-operation
+    rows) but not yet delivered as a user row.
+
+    A queued result already fills the launch entry's final_content, so the
+    pending-agents check goes clean — yet the turn provably continues: the
+    delivery row and Claude's follow-up response are still outstanding.
+    Queue remove rows carry no notification content and cannot be matched, so
+    a removed notification keeps the gate closed until the turn ends — the
+    safe direction (close-time emission is always correct).
+    """
+    queued: List[str] = []
+    delivered = set()
+    for row in rows:
+        if not is_task_notification_row(row):
+            continue
+        tool_use_id = get_tool_use_id_from_task_notification(row)
+        if not tool_use_id:
+            continue
+        if row.get("type") == "queue-operation":
+            queued.append(tool_use_id)
+        else:
+            delivered.add(tool_use_id)
+    return [tool_use_id for tool_use_id in queued if tool_use_id not in delivered]
+
+
+def turn_has_unresolved_async_activity(turn: Turn) -> bool:
+    """True while the turn's emitted form can provably still change: an async
+    agent has not delivered its final result, or a notification is queued but
+    not yet delivered. Exported roots are immutable, so emission must wait
+    for this gate (or for the turn to close)."""
+    return bool(
+        get_pending_agent_tool_use_ids(turn)
+        or get_undelivered_queued_notification_ids(turn.rows)
+    )
+
+
 def get_turns_to_emit(
     turns: List[Turn],
     session_state: SessionState,
@@ -831,27 +906,41 @@ def add_task_notification_row(
     row: Dict[str, Any],
     state: TurnAssemblyState,
     task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+    closed_turns: Optional[List[Turn]] = None,
 ) -> bool:
     if not is_task_notification_row(row):
         return False
 
-    if state.current_turn_user_row is None:
-        return True
-
     tool_use_id = get_tool_use_id_for_task_notification(row, task_id_to_tool_use_id)
     if not tool_use_id:
-        state.current_rows.append(row)
+        if state.current_turn_user_row is not None:
+            state.current_rows.append(row)
         return True
 
-    existing_result = state.tool_results_by_id.get(tool_use_id)
-    if isinstance(existing_result, dict):
-        existing_result["final_content"] = get_result_from_task_notification(row)
-        existing_result["final_timestamp"] = row.get("timestamp")
-    else:
-        state.tool_results_by_id[tool_use_id] = {
-            "content": get_result_from_task_notification(row),
-            "timestamp": row.get("timestamp"),
-        }
+    if state.current_turn_user_row is not None:
+        existing_result = state.tool_results_by_id.get(tool_use_id)
+        if isinstance(existing_result, dict):
+            existing_result["final_content"] = get_result_from_task_notification(row)
+            existing_result["final_timestamp"] = row.get("timestamp")
+            state.current_rows.append(row)
+            return True
+
+    # The launching turn may have been closed earlier in this same batch (a
+    # new user row arrived before the notification did).
+    for closed_turn in reversed(closed_turns or []):
+        closed_result = closed_turn.tool_results_by_id.get(tool_use_id)
+        if isinstance(closed_result, dict):
+            closed_result["final_content"] = get_result_from_task_notification(row)
+            closed_result["final_timestamp"] = row.get("timestamp")
+            closed_turn.rows.append(row)
+            return True
+
+    if state.current_turn_user_row is None:
+        return True
+    state.tool_results_by_id[tool_use_id] = {
+        "content": get_result_from_task_notification(row),
+        "timestamp": row.get("timestamp"),
+    }
     state.current_rows.append(row)
     return True
 
@@ -935,16 +1024,21 @@ def add_assistant_row(row: Dict[str, Any], state: TurnAssemblyState) -> None:
     state.current_rows.append(row)
 
 
-def build_turns(
+def assemble_turns(
     rows: List[Dict[str, Any]],
     task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
-) -> List[Turn]:
+) -> Tuple[List[Turn], Optional[Turn], List[Dict[str, Any]]]:
     """
     Groups incremental transcript rows into turns:
     user (non-tool-result) -> assistant messages -> (tool_result rows, possibly interleaved)
     Uses:
     - assistant rows merged by message.id (all content blocks concatenated)
     - tool results dedupe by tool_use_id (latest wins)
+
+    Returns (closed_turns, trailing_turn, trailing_turn_rows). The trailing
+    turn is the one still open at the end of the rows: only a following user
+    row proves a turn is complete, so incremental callers keep its raw rows
+    and re-attach them to the next batch instead of emitting it right away.
     """
     turns: List[Turn] = []
     state = TurnAssemblyState()
@@ -956,7 +1050,7 @@ def build_turns(
         if add_tool_result_row(row, state):
             continue
 
-        if add_task_notification_row(row, state, task_id_to_tool_use_id):
+        if add_task_notification_row(row, state, task_id_to_tool_use_id, closed_turns=turns):
             continue
 
         role = get_user_or_assistant_role_from_row(row)
@@ -975,10 +1069,57 @@ def build_turns(
 
         # ignore unknown rows
 
-    turn = build_turn_from_state(state)
-    if turn is not None:
-        turns.append(turn)
+    trailing_turn = build_turn_from_state(state)
+    trailing_turn_rows = list(state.current_rows) if state.current_turn_user_row is not None else []
+    return turns, trailing_turn, trailing_turn_rows
+
+
+def build_turns(
+    rows: List[Dict[str, Any]],
+    task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+) -> List[Turn]:
+    """Group a complete row list into turns, including the trailing one."""
+    turns, trailing_turn, _ = assemble_turns(rows, task_id_to_tool_use_id)
+    if trailing_turn is not None:
+        turns.append(trailing_turn)
     return turns
+
+
+def build_open_turn(trailing_turn: Optional[Turn],
+                    trailing_turn_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Package the trailing turn for the session state. Emission progress is
+    NOT kept here: it lives in session_state.turn_progress (keyed by the
+    user-row uuid) so it survives the open -> closed -> deferred transitions."""
+    if not trailing_turn_rows:
+        return {}
+    if trailing_turn is not None:
+        user_row_uuid = trailing_turn.user_msg.get("uuid")
+    else:
+        user_row_uuid = trailing_turn_rows[0].get("uuid")
+    return {
+        "user_row_uuid": user_row_uuid,
+        "rows": trailing_turn_rows,
+    }
+
+
+def assign_turn_numbers(turns: List[Turn], trailing_turn: Optional[Turn],
+                        session_state: SessionState) -> None:
+    """Assigns each turn its number the first time it is seen (in transcript
+    order). Keyed by the turn's user-row uuid. Numbering seeds past
+    max(turn_count, highest assigned) so a cleared or missing turn_numbers
+    dict (rotation, legacy state files) cannot restart numbering at 1."""
+    trailing = [trailing_turn] if trailing_turn is not None else []
+    next_turn_number = 1 + max(
+        session_state.turn_count,
+        max(session_state.turn_numbers.values(), default=0),
+    )
+    for turn in turns + trailing:
+        user_row_uuid = turn.user_msg.get("uuid")
+        if not isinstance(user_row_uuid, str) or not user_row_uuid:
+            continue
+        if user_row_uuid not in session_state.turn_numbers:
+            session_state.turn_numbers[user_row_uuid] = next_turn_number
+            next_turn_number += 1
 
 
 def get_new_turns_from_transcript(
@@ -991,6 +1132,17 @@ def get_new_turns_from_transcript(
     rows, session_state = read_new_jsonl(transcript_path, session_state)
     task_id_to_tool_use_id = get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id)
 
+    # Re-attach the trailing open turn from the previous run. Stop fires
+    # multiple times within one logical turn, so a batch can begin with
+    # user-less continuation rows (task notifications, assistant rows); with
+    # the open turn's rows in front they attach to it instead of being
+    # dropped by turn assembly.
+    previous_open_turn = session_state.open_turn if isinstance(session_state.open_turn, dict) else {}
+    held_rows = previous_open_turn.get("rows")
+    if isinstance(held_rows, list) and held_rows:
+        rows = held_rows + rows
+        session_state.open_turn = {}
+
     deferred_turn_row_lists, rows = resolve_deferred_agent_turns(rows, session_state, task_id_to_tool_use_id)
 
     if flush_deferred_agent_turns and session_state.pending_agent_turns:
@@ -1000,7 +1152,11 @@ def get_new_turns_from_transcript(
             deferred_turn_row_lists = deferred_turn_row_lists + flushed_row_lists
 
     if flush_deferred_agent_turns and session_state.pending_task_notifications:
-        debug(f"Dropping {len(session_state.pending_task_notifications)} unresolved task notification(s) at session end")
+        # Last chance: appended to the row stream, a stashed notification can
+        # still attach to the (reattached) open turn or a turn closed in this
+        # batch; anything unmatched is discarded with the session.
+        debug(f"Replaying {len(session_state.pending_task_notifications)} stashed task notification(s) at session end")
+        rows = rows + session_state.pending_task_notifications
         session_state.pending_task_notifications = []
 
     # Each deferred row list is a complete turn from an earlier hook run, so
@@ -1009,9 +1165,20 @@ def get_new_turns_from_transcript(
     turns: List[Turn] = []
     for deferred_turn_rows in deferred_turn_row_lists:
         turns.extend(build_turns(deferred_turn_rows, task_id_to_tool_use_id))
-    if rows:
-        turns.extend(build_turns(rows, task_id_to_tool_use_id))
 
+    batch_turns, trailing_turn, trailing_turn_rows = assemble_turns(rows, task_id_to_tool_use_id)
+    turns.extend(batch_turns)
+
+    if flush_deferred_agent_turns:
+        # SessionEnd: nothing can continue the trailing turn anymore.
+        if trailing_turn is not None:
+            turns.append(trailing_turn)
+    else:
+        session_state.open_turn = build_open_turn(trailing_turn, trailing_turn_rows)
+        if trailing_turn_rows:
+            debug(f"Holding trailing open turn ({len(trailing_turn_rows)} row(s)) until a new user row closes it")
+
+    assign_turn_numbers(turns, trailing_turn, session_state)
     return turns, session_state
 
 def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
@@ -1065,10 +1232,15 @@ def get_task_id_to_tool_use_id(
 
 # ---- Low-level Langfuse helpers ----
 def to_otel_nanoseconds(ts: Optional[datetime]) -> Optional[int]:
-    """Convert a datetime to OTel-style nanoseconds since epoch."""
+    """Convert a datetime to OTel-style nanoseconds since epoch.
+
+    Rounded at microsecond precision: naive float math (timestamp() * 1e9
+    truncated with int()) lands just below the exact millisecond for many
+    values, shifting emitted times by -1ms vs the transcript.
+    """
     if ts is None:
         return None
-    return int(ts.timestamp() * 1_000_000_000)
+    return round(ts.timestamp() * 1_000_000) * 1_000
 
 def _get_latest_timestamp(*timestamps: Optional[datetime]) -> Optional[datetime]:
     present_timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
@@ -1146,6 +1318,7 @@ def _start_root_otel_span(langfuse: Langfuse, name: str, start_ns: Optional[int]
 def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
                      start_time: Optional[datetime],
                      parent_otel_span: Any = None,
+                     as_root: bool = False,
                      forced_trace_id: Optional[str] = None,
                      **obs_kwargs: Any) -> Any:
     """Create a Langfuse observation with an explicit OTel start_time.
@@ -1175,6 +1348,18 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
             otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
     else:
         otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id)
+    if as_root:
+        # SDK/server contract: spans under a synthetic trace-id carrier have a
+        # parentSpanId that never exports, so the server only treats them as
+        # the trace root (deriving trace input/output/name) with this marker.
+        otel_span.set_attribute("langfuse.internal.as_root", True)
+    else:
+        # The SDK span processor auto-marks spans whose parent this process
+        # never exported as langfuse.internal.is_app_root — true for every
+        # continuation-firing child under the carrier, which then shows up as
+        # a root in the events view. Children are never app roots; overriding
+        # the attribute wins over the processor's earlier write.
+        otel_span.set_attribute("langfuse.internal.is_app_root", False)
     return langfuse._create_observation_from_otel_span(
         otel_span=otel_span,
         as_type=as_type,
@@ -1384,6 +1569,40 @@ def build_tool_metadata(
         })
     return tool_metadata
 
+@dataclass
+class EmissionCursor:
+    """Tracks which of a turn's observations were already emitted (namespaced
+    keys: gen:/tool:/subagent:) so continuation firings only emit what is new.
+
+    completed_only skips observations whose emitted form could still change
+    (generation awaiting tool results, running async subagent); at turn close
+    the cursor runs with completed_only=False so everything remaining ships.
+    """
+    emitted: set
+    completed_only: bool = False
+    newly_emitted: List[str] = field(default_factory=list)
+
+    def should_emit(self, key: str, complete: bool = True) -> bool:
+        if key in self.emitted:
+            return False
+        if self.completed_only and not complete:
+            return False
+        self.emitted.add(key)
+        self.newly_emitted.append(key)
+        return True
+
+
+def fresh_cursor() -> EmissionCursor:
+    """Cursor for one-shot emission: nothing emitted yet, emit everything."""
+    return EmissionCursor(emitted=set(), completed_only=False)
+
+
+def generation_emission_key(assistant_index: int, assistant_message: Dict[str, Any]) -> str:
+    # message.id is the merge unit of assistant rows; the noid fallback is
+    # stable because turns are always rebuilt in transcript order.
+    return f"gen:{get_message_id(assistant_message) or f'noid:{assistant_index}'}"
+
+
 def emit_single_tool_observation(
     langfuse: Langfuse,
     parent_otel_span: Any,
@@ -1393,6 +1612,8 @@ def emit_single_tool_observation(
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
     pending_subagents: List[Dict[str, Any]],
     pending_async_tool_results: List[Dict[str, Any]],
+    cursor: EmissionCursor,
+    tool_key: str,
 ) -> EmittedSingleToolObservation:
     tool_use_id = str(tool_use.get("id") or "")
     tool_name = tool_use.get("name") or "unknown"
@@ -1416,16 +1637,20 @@ def emit_single_tool_observation(
     tool_metadata = build_tool_metadata(tool_name, tool_use_id, tool_input_meta, tool_result, subagent)
 
     tool_use_timestamp = parse_timestamp(turn.tool_use_timestamps_by_id.get(tool_use_id)) or assistant_timestamp
-    tool_span = _start_backdated(
-        langfuse,
-        name=f"Tool: {tool_name}",
-        as_type="tool",
-        start_time=tool_use_timestamp,
-        parent_otel_span=parent_otel_span,
-        input=tool_input,
-        metadata=tool_metadata,
-    )
-    tool_span.update(output=tool_output)
+    # A tool span's end time comes from its result row, so it only counts as
+    # complete once that row exists.
+    tool_span = None
+    if cursor.should_emit(tool_key, complete=tool_result_entry is not None):
+        tool_span = _start_backdated(
+            langfuse,
+            name=f"Tool: {tool_name}",
+            as_type="tool",
+            start_time=tool_use_timestamp,
+            parent_otel_span=parent_otel_span,
+            input=tool_input,
+            metadata=tool_metadata,
+        )
+        tool_span.update(output=tool_output)
 
     subagent_end_timestamp = None
     if subagent:
@@ -1437,12 +1662,24 @@ def emit_single_tool_observation(
                 "ready_timestamp": tool_result.final_result_timestamp,
             })
         else:
-            subagent_end_timestamp = emit_subagent_observations(
-                langfuse,
-                parent_otel_span,
-                subagent,
-                tool_use_timestamp,
+            # Without a final result the subagent may still be running: its
+            # transcript on disk is not authoritative yet. No tool_result row
+            # at all means the tool (sync agents included) is still executing,
+            # so completeness must fail closed like the neighboring gates.
+            subagent_still_running = tool_result_entry is None or (
+                is_async_agent_launch_result(tool_result_entry)
+                and (
+                    not isinstance(tool_result_entry, dict)
+                    or tool_result_entry.get("final_content") is None
+                )
             )
+            if cursor.should_emit(f"subagent:{tool_use_id or tool_key}", complete=not subagent_still_running):
+                subagent_end_timestamp = emit_subagent_observations(
+                    langfuse,
+                    parent_otel_span,
+                    subagent,
+                    tool_use_timestamp,
+                )
 
     tool_end_timestamp = _get_latest_timestamp(tool_result.result_timestamp, tool_use_timestamp)
     handoff_timestamp = (
@@ -1451,7 +1688,8 @@ def emit_single_tool_observation(
         or subagent_end_timestamp
         or assistant_timestamp
     )
-    tool_span.end(end_time=to_otel_nanoseconds(tool_end_timestamp))
+    if tool_span is not None:
+        tool_span.end(end_time=to_otel_nanoseconds(tool_end_timestamp))
 
     if tool_result.final_result_timestamp is not None and tool_result.final_output is not None:
         pending_async_tool_results.append({
@@ -1478,17 +1716,22 @@ def emit_tool_observation_batch(
     parent_otel_span: Any,
     turn: Turn,
     assistant_message: Dict[str, Any],
+    assistant_index: int,
     tool_uses: List[Dict[str, Any]],
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
     pending_subagents: List[Dict[str, Any]],
     pending_async_tool_results: List[Dict[str, Any]],
+    cursor: EmissionCursor,
 ) -> EmittedToolObservationBatch:
     assistant_timestamp = parse_timestamp(assistant_message)
+    generation_key = generation_emission_key(assistant_index, assistant_message)
     tool_result_timestamps: List[datetime] = []
     emitted_tool_results: List[Dict[str, Any]] = []
     latest_tool_end_timestamp: Optional[datetime] = None
 
-    for tool_use in tool_uses:
+    for tool_index, tool_use in enumerate(tool_uses):
+        tool_use_id = str(tool_use.get("id") or "")
+        tool_key = f"tool:{tool_use_id}" if tool_use_id else f"tool:{generation_key}:{tool_index}"
         emitted_tool = emit_single_tool_observation(
             langfuse,
             parent_otel_span,
@@ -1498,6 +1741,8 @@ def emit_tool_observation_batch(
             subagent_transcripts_by_tool_use_id,
             pending_subagents,
             pending_async_tool_results,
+            cursor,
+            tool_key,
         )
         if emitted_tool.handoff_timestamp is not None:
             tool_result_timestamps.append(emitted_tool.handoff_timestamp)
@@ -1627,14 +1872,38 @@ def emit_generation_observation(
 def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn,
                            start_timestamp: Optional[datetime],
                            generation_prefix: str = "LLM Call",
-                           subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[datetime]:
-    """Emit a turn's generations and tool observations under an existing span."""
+                           subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+                           cursor: Optional[EmissionCursor] = None) -> Optional[datetime]:
+    """Emit a turn's generations and tool observations under an existing span.
+
+    The full turn is always walked so cross-observation context (generation
+    inputs from previous tool results, timestamps) stays correct; the cursor
+    only gates which spans are actually created. Without a cursor everything
+    is emitted (one-shot behavior).
+    """
+    cursor = cursor if cursor is not None else fresh_cursor()
     user_text, _ = truncate_text(extract_text_from_content(get_content_from_row(turn.user_msg)))
     previous_timestamp = start_timestamp
     previous_tool_results: List[Dict[str, Any]] = []
     pending_async_tool_results: List[Dict[str, Any]] = []
     pending_subagents: List[Dict[str, Any]] = []
     latest_end_timestamp = start_timestamp
+    # True once the walk passed an async launch whose final result is still
+    # missing; later generations' inputs can then still change retroactively.
+    unresolved_async_launch_seen = False
+
+    def emit_pending_subagent(pending_subagent: Dict[str, Any]) -> None:
+        nonlocal latest_end_timestamp
+        subagent_key = f"subagent:{pending_subagent.get('tool_use_id')}"
+        if not cursor.should_emit(subagent_key, complete=True):
+            return
+        subagent_end_timestamp = emit_subagent_observations(
+            langfuse,
+            parent_otel_span,
+            pending_subagent["subagent"],
+            pending_subagent.get("display_start_timestamp") or pending_subagent.get("start_timestamp"),
+        )
+        latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
 
     for assistant_index, assistant_message in enumerate(turn.assistant_msgs):
         assistant_timestamp = parse_timestamp(assistant_message)
@@ -1644,13 +1913,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                 assistant_timestamp,
             )
             for ready_subagent in ready_subagents:
-                subagent_end_timestamp = emit_subagent_observations(
-                    langfuse,
-                    parent_otel_span,
-                    ready_subagent["subagent"],
-                    ready_subagent.get("display_start_timestamp") or ready_subagent.get("start_timestamp"),
-                )
-                latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
+                emit_pending_subagent(ready_subagent)
 
         ready_async_tool_results: List[Dict[str, Any]] = []
         if assistant_index > 0 and pending_async_tool_results:
@@ -1667,14 +1930,33 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             ready_async_tool_results,
         )
         generation_start_timestamp = previous_timestamp or assistant_timestamp
-        generation_span = emit_generation_observation(
-            langfuse,
-            parent_otel_span=parent_otel_span,
-            generation_prefix=generation_prefix,
-            assistant_index=assistant_index,
-            start_timestamp=generation_start_timestamp,
-            generation_kwargs=generation_kwargs,
+        # A generation is only complete when its emitted form cannot change
+        # anymore: (a) every tool_use of this message has its result (end
+        # time), (b) no earlier async launch is unresolved (a late
+        # notification would retroactively join this generation's input).
+        # The trailing message needs no extra guard: Stop only fires after a
+        # response is fully written, and no message.id ever grows across a
+        # Stop boundary (0 cases across all local transcripts).
+        generation_complete = (
+            not unresolved_async_launch_seen
+            and all(
+                str(tool_use.get("id") or "") in turn.tool_results_by_id
+                for tool_use in tool_uses
+            )
         )
+        generation_span = None
+        if cursor.should_emit(
+            generation_emission_key(assistant_index, assistant_message),
+            complete=generation_complete,
+        ):
+            generation_span = emit_generation_observation(
+                langfuse,
+                parent_otel_span=parent_otel_span,
+                generation_prefix=generation_prefix,
+                assistant_index=assistant_index,
+                start_timestamp=generation_start_timestamp,
+                generation_kwargs=generation_kwargs,
+            )
         update_pending_subagent_display_start_after_launch_response(
             pending_subagents,
             previous_tool_results,
@@ -1686,10 +1968,12 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             parent_otel_span,
             turn,
             assistant_message,
+            assistant_index,
             tool_uses,
             subagent_transcripts_by_tool_use_id,
             pending_subagents,
             pending_async_tool_results,
+            cursor,
         )
         latest_end_timestamp = _get_latest_timestamp(
             latest_end_timestamp,
@@ -1701,12 +1985,20 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             if emitted_tools.result_timestamps
             else assistant_timestamp
         )
-        generation_span.end(
-            end_time=to_otel_nanoseconds(
-                generation_end_timestamp or assistant_timestamp or previous_timestamp
+        if generation_span is not None:
+            generation_span.end(
+                end_time=to_otel_nanoseconds(
+                    generation_end_timestamp or assistant_timestamp or previous_timestamp
+                )
             )
-        )
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, generation_end_timestamp)
+
+        for tool_use in tool_uses:
+            entry = turn.tool_results_by_id.get(str(tool_use.get("id") or ""))
+            if is_async_agent_launch_result(entry) and (
+                not isinstance(entry, dict) or entry.get("final_content") is None
+            ):
+                unresolved_async_launch_seen = True
 
         previous_tool_results = emitted_tools.tool_results
         if emitted_tools.result_timestamps:
@@ -1715,13 +2007,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             previous_timestamp = assistant_timestamp
 
     for pending_subagent in pending_subagents:
-        subagent_end_timestamp = emit_subagent_observations(
-            langfuse,
-            parent_otel_span,
-            pending_subagent["subagent"],
-            pending_subagent.get("display_start_timestamp") or pending_subagent.get("start_timestamp"),
-        )
-        latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
+        emit_pending_subagent(pending_subagent)
 
     return latest_end_timestamp
 
@@ -1847,61 +2133,184 @@ def build_trace_metadata(
             trace_metadata[dst_key] = value
     return trace_metadata
 
-def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
-              user_id: Optional[str] = None,
-              subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
-              trace_seed: Optional[str] = None) -> None:
+def is_valid_span_id_hex(span_id: Any) -> bool:
+    return (
+        isinstance(span_id, str)
+        and len(span_id) == 16
+        and all(c in "0123456789abcdef" for c in span_id)
+    )
+
+
+def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
+                  root_span_id: Optional[str] = None,
+                  trace_id: Optional[str] = None) -> Optional[Any]:
+    """Return a carrier span pinning the turn's trace id, seeded from session
+    id + the turn's user-row uuid.
+
+    Without root_span_id the carrier gets a phantom span id: it is never
+    exported, OTel merely requires a valid non-zero id, and children become
+    the trace's roots. With root_span_id (the 16-hex observation id of a
+    root span opened by an earlier firing) children nest under that span
+    instead, so continuation firings can extend an already-emitted turn.
+
+    trace_id (32-hex) overrides the seeded derivation: continuation firings
+    pass the id stored at root creation so a turn never switches trace
+    mid-flight (e.g. when its root was opened under a
+    CC_LANGFUSE_TRACE_SEED-forced id).
+    """
+    if not isinstance(user_row_uuid, str) or not user_row_uuid:
+        return None
+    if root_span_id is not None and not is_valid_span_id_hex(root_span_id):
+        # A corrupt stored span id must not cost the deterministic trace id:
+        # degrade to the phantom-parent path instead of the except fallback.
+        debug(f"remote_parent: ignoring malformed root_span_id {root_span_id!r}")
+        root_span_id = None
+    if trace_id is not None and not _is_valid_trace_id_hex(trace_id):
+        debug(f"remote_parent: ignoring malformed trace_id {trace_id!r}")
+        trace_id = None
+    try:
+        if trace_id is None:
+            trace_id = langfuse.create_trace_id(seed=f"{session_id}:{user_row_uuid}")
+        parent_context = otel_trace_api.SpanContext(
+            trace_id=int(trace_id, 16),
+            span_id=int(root_span_id, 16) if root_span_id else (random.getrandbits(64) or 1),
+            trace_flags=otel_trace_api.TraceFlags(0x01),  # sampled
+            is_remote=False,
+        )
+        return otel_trace_api.NonRecordingSpan(parent_context)
+    except Exception as e:
+        debug(f"remote_parent failed, falling back to random trace id: {e}")
+        return None
+
+
+def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
+                        transcript_path: Path, trace_seed: Optional[str] = None) -> Any:
+    """Open the turn's root span, backdated to the user message.
+
+    The root exports exactly once, at the first firing that is allowed to
+    emit the turn (async activity resolved, or turn closed); later firings
+    only attach children under it via the remote-parent carrier.
+
+    With trace_seed set (CC_LANGFUSE_TRACE_SEED) the root adopts the
+    externally precomputable trace id derived from seed and turn number;
+    otherwise the session:user-row-uuid carrier pins the trace id.
+    """
     user_text_raw = extract_text_from_content(get_content_from_row(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
-
-    last_assistant = turn.assistant_msgs[-1]
-    final_assistant_text, _ = truncate_text(extract_text_from_content(get_content_from_row(last_assistant)))
-
-    user_ts = parse_timestamp(turn.user_msg)
-    last_assistant_ts = parse_timestamp(last_assistant)
-    turn_end_ts = get_turn_end_timestamp(turn)
     trace_metadata = build_trace_metadata(session_id, turn_num, turn, transcript_path, user_text_meta)
-    tags = get_trace_tags(turn, subagent_transcripts_by_tool_use_id)
-
-    trace_name = trace_display_name(session_id, turn_num)
-    root_observation_name = "Conversational Turn"
-
-    # Opt-in deterministic trace ids: fail open to the auto-generated id.
+    # Opt-in deterministic trace ids: fail open to the carrier-derived id.
     forced_trace_id: Optional[str] = None
     if trace_seed:
         try:
             forced_trace_id = derive_turn_trace_id(trace_seed, turn_num)
         except Exception as e:
             debug(f"trace id derivation failed for turn {turn_num}: {e}")
+    return _start_backdated(
+        langfuse,
+        name="Conversational Turn",
+        as_type="span",
+        start_time=parse_timestamp(turn.user_msg),
+        parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
+        forced_trace_id=forced_trace_id,
+        as_root=True,
+        input={"role": "user", "content": user_text},
+        metadata=trace_metadata,
+    )
 
+
+
+def build_turn_output_payload(turn: Turn) -> Dict[str, Any]:
+    last_assistant = turn.assistant_msgs[-1]
+    text, _ = truncate_text(extract_text_from_content(get_content_from_row(last_assistant)))
+    return {"role": "assistant", "content": text}
+
+
+def get_root_span_end_time(turn: Turn, obs_end_ts: Optional[datetime]) -> Optional[datetime]:
+    return _get_latest_timestamp(
+        get_turn_end_timestamp(turn),
+        parse_timestamp(turn.assistant_msgs[-1]),
+        obs_end_ts,
+        parse_timestamp(turn.user_msg),
+    )
+
+
+def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
+              turn: Turn, transcript_path: Path,
+              user_id: Optional[str] = None,
+              subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+              progress: Optional[Dict[str, Any]] = None,
+              close: bool = True,
+              trace_seed: Optional[str] = None) -> Dict[str, Any]:
+    """Emit a turn, resuming from prior firings' progress.
+
+    With no progress and close=True this is the classic one-shot emission.
+    With close=False only ready observations ship (those whose emitted form
+    can no longer change); a later firing resumes from the returned progress
+    (root span id + emitted keys) and adds what is still missing.
+
+    The root span exports exactly once, carrying the output/end time known
+    at that moment — exported spans are immutable, so callers must not emit
+    a turn whose root fields can provably still change (see
+    turn_has_unresolved_async_activity).
+    """
+    progress = dict(progress or {})
+    cursor = EmissionCursor(
+        emitted=set(k for k in (progress.get("emitted_keys") or []) if isinstance(k, str)),
+        completed_only=not close,
+    )
     with propagate_attributes(
         session_id=session_id,
         user_id=user_id,
-        trace_name=trace_name,
-        tags=tags,
+        trace_name=trace_display_name(session_id, turn_num),
+        tags=get_trace_tags(turn, subagent_transcripts_by_tool_use_id),
     ):
-        trace_span = _start_backdated(
-            langfuse,
-            name=root_observation_name,
-            as_type="span",
-            start_time=user_ts,
-            forced_trace_id=forced_trace_id,
-            input={"role": "user", "content": user_text},
-            metadata=trace_metadata,
-        )
+        trace_span = None
+        root_span_id = progress.get("root_span_id")
+        if not is_valid_span_id_hex(root_span_id):
+            trace_span = open_turn_root_span(
+                langfuse, session_id, turn_num, turn, transcript_path, trace_seed=trace_seed
+            )
+            root_span_id = getattr(trace_span, "id", None)
+            progress["root_span_id"] = root_span_id
+            progress["trace_id"] = getattr(trace_span, "trace_id", None)
+            parent_otel_span = trace_span._otel_span
+        else:
+            # Root span exported by an earlier firing: attach children to it
+            # via a carrier. The stored trace id wins over re-derivation so
+            # seeded turns resume into the same trace.
+            parent_otel_span = remote_parent(
+                langfuse, session_id, turn.user_msg.get("uuid"),
+                root_span_id=root_span_id, trace_id=progress.get("trace_id"),
+            )
         obs_end_ts = emit_turn_observations(
             langfuse,
-            trace_span._otel_span,
+            parent_otel_span,
             turn,
-            user_ts,
+            parse_timestamp(turn.user_msg),
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            cursor=cursor,
         )
-        trace_span.update(output={"role": "assistant", "content": final_assistant_text})
-        trace_span.end(end_time=to_otel_nanoseconds(_get_latest_timestamp(turn_end_ts, last_assistant_ts, obs_end_ts, user_ts)))
+        if trace_span is not None:
+            # The root exports exactly once: end time and output are the
+            # values known now, and stay — exported fields are immutable.
+            trace_span.update(output=build_turn_output_payload(turn))
+            trace_span.end(
+                end_time=to_otel_nanoseconds(get_root_span_end_time(turn, obs_end_ts))
+            )
+    progress["emitted_keys"] = sorted(cursor.emitted)
+    return progress
 
 
 # ---- New turn emission orchestration ----
-def emit_ready_turns(
+def pop_turn_progress(session_state: SessionState, turn: Turn) -> Optional[Dict[str, Any]]:
+    user_row_uuid = turn.user_msg.get("uuid")
+    if not isinstance(user_row_uuid, str) or not user_row_uuid:
+        return None
+    entry = session_state.turn_progress.pop(user_row_uuid, None)
+    return entry if isinstance(entry, dict) else None
+
+
+def emit_and_close_ready_turns(
     langfuse: Langfuse,
     session_id: str,
     transcript_path: Path,
@@ -1913,9 +2322,21 @@ def emit_ready_turns(
     trace_seed: Optional[str] = None,
 ) -> int:
     emitted = 0
+    # Turns without a user-row uuid bypass assign_turn_numbers; seed their
+    # fallback from the same monotonic sequence so numbers never collide.
+    next_fallback_turn_number = 1 + max(
+        session_state.turn_count,
+        max(session_state.turn_numbers.values(), default=0),
+    )
     for turn in turns_to_emit:
         emitted += 1
-        turn_num = session_state.turn_count + emitted
+        turn_num = session_state.turn_numbers.get(turn.user_msg.get("uuid"))
+        if turn_num is None:
+            turn_num = next_fallback_turn_number
+            next_fallback_turn_number += 1
+        # Progress from firings while this turn was still open; closing the
+        # turn consumes it so the emitted keys don't outlive the turn.
+        progress = pop_turn_progress(session_state, turn)
         try:
             emit_turn(
                 langfuse,
@@ -1925,6 +2346,8 @@ def emit_ready_turns(
                 transcript_path,
                 user_id=user_id,
                 subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                progress=progress,
+                close=True,
                 trace_seed=trace_seed,
             )
         except Exception as e:
@@ -1932,6 +2355,64 @@ def emit_ready_turns(
             # are visible without needing CC_LANGFUSE_DEBUG=true.
             info(f"emit_turn failed: {type(e).__name__}: {e}")
     return emitted
+
+
+def emit_ready_observations_of_open_turn(
+    langfuse: Langfuse,
+    session_id: str,
+    transcript_path: Path,
+    session_state: SessionState,
+    task_id_to_tool_use_id: Dict[str, str],
+    *,
+    user_id: Optional[str],
+    subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
+    trace_seed: Optional[str] = None,
+) -> None:
+    """Emit the held open turn once its async activity is provably resolved.
+
+    Agent-less turns pass the gate at their own Stop and ship immediately;
+    turns with async activity ship at the first Stop after every agent
+    result has been delivered (empirically: the Stop right after Claude's
+    summary). The turn keeps being held either way; only its emission
+    progress advances in session_state.turn_progress. Exported roots are
+    final — if a turn grows after a clean Stop, later firings still add
+    children, but the root's output/end time stay as emitted.
+    """
+    held_rows = session_state.open_turn.get("rows") if isinstance(session_state.open_turn, dict) else None
+    if not isinstance(held_rows, list) or not held_rows:
+        return
+    _, trailing_turn, _ = assemble_turns(held_rows, task_id_to_tool_use_id)
+    if trailing_turn is None:
+        return
+    if turn_has_unresolved_async_activity(trailing_turn):
+        # The turn provably continues (pending agent result or queued,
+        # undelivered notification). Emitting now would freeze a wrong root
+        # output forever; everything ships at the first clean Stop instead.
+        debug("Open turn held: async activity unresolved (pending agent or undelivered notification)")
+        return
+    user_row_uuid = trailing_turn.user_msg.get("uuid")
+    if not isinstance(user_row_uuid, str) or not user_row_uuid:
+        return
+    turn_num = session_state.turn_numbers.get(user_row_uuid)
+    if turn_num is None:
+        return
+    progress = session_state.turn_progress.get(user_row_uuid)
+    try:
+        progress = emit_turn(
+            langfuse,
+            session_id,
+            turn_num,
+            trailing_turn,
+            transcript_path,
+            user_id=user_id,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            progress=progress if isinstance(progress, dict) else None,
+            close=False,
+            trace_seed=trace_seed,
+        )
+        session_state.turn_progress[user_row_uuid] = progress
+    except Exception as e:
+        info(f"emitting ready observations of open turn failed: {type(e).__name__}: {e}")
 
 def emit_new_turns_from_transcript(
     langfuse: Langfuse,
@@ -1956,29 +2437,48 @@ def emit_new_turns_from_transcript(
             subagent_transcripts_by_tool_use_id,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
         )
-        if not turns:
-            save_session_state(state, key, session_state)
-            return 0
 
-        turns_to_emit = get_turns_to_emit(
-            turns,
-            session_state,
-            flush_deferred_agent_turns=flush_deferred_agent_turns,
-        )
-        emitted = emit_ready_turns(
+        emitted = 0
+        if turns:
+            turns_to_emit = get_turns_to_emit(
+                turns,
+                session_state,
+                flush_deferred_agent_turns=flush_deferred_agent_turns,
+            )
+            emitted = emit_and_close_ready_turns(
+                langfuse,
+                session_id,
+                transcript_path,
+                turns_to_emit,
+                session_state,
+                user_id=config.user_id,
+                subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                trace_seed=config.trace_seed,
+            )
+
+        session_state.turn_count += emitted
+
+        # The still-open trailing turn ships once its async activity is
+        # provably resolved (agent-less turns: at their own Stop); until
+        # then its rows keep being held and nothing is emitted.
+        emit_ready_observations_of_open_turn(
             langfuse,
             session_id,
             transcript_path,
-            turns_to_emit,
             session_state,
+            get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
             user_id=config.user_id,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
             trace_seed=config.trace_seed,
         )
 
-        session_state.turn_count += emitted
+        # Known limitation (accepted, like the crash-between-emit-and-save
+        # duplicate window): progress is persisted before the SDK flush in
+        # main(); a dropped flush leaves emitted_keys pointing at spans that
+        # never reached the server.
         save_session_state(state, key, session_state)
-        return emitted
+
+    return emitted
 
 
 def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
@@ -2008,7 +2508,7 @@ def main() -> int:
 
     config = get_langfuse_config()
     if config is None:
-        log_missing_langfuse_config()
+        debug("No LANGFUSE_PUBLIC_KEY/SECRET_KEY in environment; nothing to do")
         return 0
 
     payload = read_hook_payload()

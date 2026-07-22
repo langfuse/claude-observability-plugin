@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import itertools
 import importlib.util
 import json
 import logging
@@ -108,11 +109,18 @@ class FakeOtelSpan:
         self.name = name
         self.start_time = start_time
         self.context = context
+        self.attributes: dict[str, Any] = {}
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
 
 
 class FakeTracer:
     def start_span(self, *, name: str, start_time: int | None = None, context: Any = None) -> FakeOtelSpan:
         return FakeOtelSpan(name, start_time, context)
+
+
+_fake_observation_counter = itertools.count(1)
 
 
 class FakeObservation:
@@ -123,6 +131,10 @@ class FakeObservation:
         self.kwargs = kwargs
         self.output: Any = None
         self.end_time: int | None = None
+        # Mirror the SDK's hex id/trace_id attributes (span.py sets both).
+        n = next(_fake_observation_counter)
+        self.id = f"{n:016x}"
+        self.trace_id = f"{n:032x}"
 
     def update(self, **kwargs: Any) -> None:
         if "output" in kwargs:
@@ -137,6 +149,12 @@ class FakeLangfuse:
     def __init__(self) -> None:
         self._otel_tracer = FakeTracer()
         self.observations: list[FakeObservation] = []
+
+    @staticmethod
+    def create_trace_id(*, seed: str | None = None) -> str:
+        # Mirrors SDK 4.x: sha256(seed).digest()[:16].hex()
+        assert seed, "tests always pass a seed"
+        return hashlib.sha256(seed.encode("utf-8")).digest()[:16].hex()
 
     def _create_observation_from_otel_span(
         self,

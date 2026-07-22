@@ -116,17 +116,24 @@ def test_completed_async_agent_turn_is_ready_to_emit(
     state = hook_module.SessionState()
     subagents = hook_module.get_subagent_transcripts_by_tool_use_id(transcript)
 
+    # The trailing turn is held open on Stop; SessionEnd closes and emits it.
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state, subagents)
-    turns_to_emit = hook_module.get_turns_to_emit(turns, state)
+    assert turns == []
+    assert state.open_turn.get("rows")
+
+    turns, state = hook_module.get_new_turns_from_transcript(
+        transcript, state, subagents, flush_deferred_agent_turns=True)
+    turns_to_emit = hook_module.get_turns_to_emit(turns, state, flush_deferred_agent_turns=True)
 
     assert len(turns) == 1
     assert len(turns_to_emit) == 1
     assert state.pending_agent_turns == []
+    assert state.open_turn == {}
     result = turns[0].tool_results_by_id["toolu_agent_complete"]
     assert result["final_content"] == "Subagent summary is ready."
 
 
-def test_uncompleted_async_agent_turn_is_deferred_until_flush(
+def test_uncompleted_async_agent_turn_is_held_open_and_flushed_at_session_end(
     hook_module,
     fixture_transcript_path,
 ):
@@ -137,9 +144,11 @@ def test_uncompleted_async_agent_turn_is_deferred_until_flush(
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state, subagents)
     turns_to_emit = hook_module.get_turns_to_emit(turns, state)
 
+    # Held open (its agent may still notify and Claude may continue),
+    # not deferred: deferral applies to closed turns only.
     assert turns_to_emit == []
-    assert len(state.pending_agent_turns) == 1
-    assert state.pending_agent_turns[0]["pending_tool_use_ids"] == ["toolu_agent_deferred"]
+    assert state.pending_agent_turns == []
+    assert state.open_turn.get("rows")
 
     flushed_turns, state = hook_module.get_new_turns_from_transcript(
         transcript,
@@ -155,6 +164,7 @@ def test_uncompleted_async_agent_turn_is_deferred_until_flush(
 
     assert len(flushed_to_emit) == 1
     assert state.pending_agent_turns == []
+    assert state.open_turn == {}
 
 
 def test_turn_waiting_on_multiple_agents_resolves_only_after_all_notifications(hook_module):
@@ -303,11 +313,11 @@ def test_mid_turn_notification_does_not_corrupt_the_surrounding_turn(hook_module
     transcript = tmp_path / "transcript.jsonl"
     state = hook_module.SessionState()
 
-    # Hook run 1: turn 1 launches an async agent and ends -> deferred.
+    # Hook run 1: turn 1 launches an async agent and ends -> held open.
     append_jsonl(transcript, launch_turn_rows("toolu_bg"))
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state)
     assert hook_module.get_turns_to_emit(turns, state) == []
-    assert len(state.pending_agent_turns) == 1
+    assert state.open_turn.get("rows")
 
     # Hook run 2: turn 2 is mid-flight when the notification lands between
     # two of its assistant messages (the normal real-world shape).
@@ -328,17 +338,22 @@ def test_mid_turn_notification_does_not_corrupt_the_surrounding_turn(hook_module
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state)
     turns_to_emit = hook_module.get_turns_to_emit(turns, state)
 
+    # Turn 1 is closed by user-2 and emitted complete; the notification that
+    # arrived after user-2 still reaches it. Turn 2 is now the open turn.
     assert state.pending_agent_turns == []
-    assert len(turns_to_emit) == 2
+    assert len(turns_to_emit) == 1
+    closed_turn = turns_to_emit[0]
+    assert closed_turn.user_msg["uuid"] == "user-1"
+    assert [m["message"]["id"] for m in closed_turn.assistant_msgs] == ["msg-1", "msg-2"]
+    assert closed_turn.tool_results_by_id["toolu_bg"]["final_content"] == "Background result."
 
-    resolved_turn, current_turn = turns_to_emit
-    # The deferred turn is rebuilt intact, with the notification result attached.
-    assert resolved_turn.user_msg["uuid"] == "user-1"
-    assert [m["message"]["id"] for m in resolved_turn.assistant_msgs] == ["msg-1", "msg-2"]
-    assert resolved_turn.tool_results_by_id["toolu_bg"]["final_content"] == "Background result."
-    # The current turn keeps ALL of its assistant messages.
-    assert current_turn.user_msg["uuid"] == "user-2"
-    assert [m["message"]["id"] for m in current_turn.assistant_msgs] == ["msg-3", "msg-4"]
+    # SessionEnd closes turn 2 with ALL of its assistant messages.
+    turns, state = hook_module.get_new_turns_from_transcript(
+        transcript, state, flush_deferred_agent_turns=True)
+    flushed = hook_module.get_turns_to_emit(turns, state, flush_deferred_agent_turns=True)
+    assert len(flushed) == 1
+    assert flushed[0].user_msg["uuid"] == "user-2"
+    assert [m["message"]["id"] for m in flushed[0].assistant_msgs] == ["msg-3", "msg-4"]
 
 
 def test_notification_before_first_assistant_row_does_not_drop_the_turn(hook_module, tmp_path):
@@ -363,12 +378,17 @@ def test_notification_before_first_assistant_row_does_not_drop_the_turn(hook_mod
     turns, state = hook_module.get_new_turns_from_transcript(transcript, state)
     turns_to_emit = hook_module.get_turns_to_emit(turns, state)
 
-    assert len(turns_to_emit) == 2
-    resolved_turn, current_turn = turns_to_emit
-    assert resolved_turn.user_msg["uuid"] == "user-1"
-    assert resolved_turn.tool_results_by_id["toolu_bg"]["final_content"] == "Background result."
-    assert current_turn.user_msg["uuid"] == "user-2"
-    assert [m["message"]["id"] for m in current_turn.assistant_msgs] == ["msg-3"]
+    assert len(turns_to_emit) == 1
+    closed_turn = turns_to_emit[0]
+    assert closed_turn.user_msg["uuid"] == "user-1"
+    assert closed_turn.tool_results_by_id["toolu_bg"]["final_content"] == "Background result."
+
+    turns, state = hook_module.get_new_turns_from_transcript(
+        transcript, state, flush_deferred_agent_turns=True)
+    flushed = hook_module.get_turns_to_emit(turns, state, flush_deferred_agent_turns=True)
+    assert len(flushed) == 1
+    assert flushed[0].user_msg["uuid"] == "user-2"
+    assert [m["message"]["id"] for m in flushed[0].assistant_msgs] == ["msg-3"]
 
 
 def sync_agent_turn_rows(tool_use_id: str = "toolu_sync", result_text: str = "Here is the final research report.") -> list[dict[str, Any]]:
@@ -511,7 +531,7 @@ def test_unresolvable_notification_is_stashed_and_resolved_when_meta_appears(hoo
 
     append_jsonl(transcript, launch_turn_rows("toolu_bg"))
     assert run() == []
-    assert len(state.pending_agent_turns) == 1
+    assert state.open_turn.get("rows")
 
     # Notification lands alone in the next batch; no meta.json on disk yet.
     append_jsonl(transcript, [
@@ -520,22 +540,29 @@ def test_unresolvable_notification_is_stashed_and_resolved_when_meta_appears(hoo
     assert run() == []
     assert len(state.pending_task_notifications) == 1
 
-    # meta.json appears late; the stashed notification resolves on this run.
+    # meta.json appears late; user-2 closes turn 1, which defers because its
+    # agent still has no final result.
     write_subagent_meta(transcript, "agent-late", "toolu_bg")
     append_jsonl(transcript, [
         make_user_row("user-2", "Next question.", "2026-01-01T00:02:00.000Z"),
         make_assistant_row("assistant-3", "msg-3",
                            [{"type": "text", "text": "Answer."}], "2026-01-01T00:02:01.000Z"),
     ])
-    emitted = run()
+    assert run() == []
+    assert len(state.pending_agent_turns) == 1
 
-    assert [t.user_msg["uuid"] for t in emitted] == ["user-1", "user-2"]
+    # Next run: the stashed notification now matches the deferred turn.
+    emitted = run()
+    assert [t.user_msg["uuid"] for t in emitted] == ["user-1"]
     assert emitted[0].tool_results_by_id["toolu_bg"]["final_content"] == "Late result."
     assert state.pending_agent_turns == []
     assert state.pending_task_notifications == []
 
+    flushed = run(flush=True)
+    assert [t.user_msg["uuid"] for t in flushed] == ["user-2"]
 
-def test_stashed_notification_without_matching_deferred_turn_is_dropped(hook_module):
+
+def test_stashed_notification_without_matching_deferred_turn_is_kept(hook_module):
     state = hook_module.SessionState(
         pending_task_notifications=[
             make_notification_row("n1", "toolu_gone", "Result", "2026-01-01T00:01:00.000Z"),
@@ -544,11 +571,12 @@ def test_stashed_notification_without_matching_deferred_turn_is_dropped(hook_mod
 
     resolved, remaining = hook_module.resolve_deferred_agent_turns([], state)
 
-    # Resolvable but nothing waits for it (turn already emitted): drop it
-    # instead of re-stashing forever.
+    # Resolvable but nothing waits for it yet: the owning turn may still be
+    # open and only defer once a user row closes it, so keep the entry (the
+    # stash is size-capped and cleared at session end).
     assert resolved == []
     assert remaining == []
-    assert state.pending_task_notifications == []
+    assert len(state.pending_task_notifications) == 1
 
 
 def test_unresolved_notifications_are_dropped_at_session_end_flush(hook_module, tmp_path):
@@ -596,3 +624,123 @@ def test_session_state_round_trips_stashed_notifications(hook_module):
     restored = hook_module.get_session_state(global_state, "key")
 
     assert restored.pending_task_notifications == [notification]
+
+
+def test_turn_continuation_across_stop_firings_is_not_lost(hook_module, tmp_path):
+    """Regression (LFE-10747): Stop can fire multiple times within one logical
+    turn (blocking hooks); continuation rows arriving in the next batch used
+    to be dropped and the turn emitted truncated."""
+    transcript = tmp_path / "transcript.jsonl"
+    state = hook_module.SessionState()
+
+    append_jsonl(transcript, [
+        make_user_row("user-1", "Question.", "2026-01-01T00:00:00.000Z"),
+        make_assistant_row("assistant-1", "msg-1",
+                           [{"type": "text", "text": "Part one."}], "2026-01-01T00:00:01.000Z"),
+    ])
+    turns, state = hook_module.get_new_turns_from_transcript(transcript, state)
+    assert hook_module.get_turns_to_emit(turns, state) == []
+
+    # Stop #2: the rest of the SAME logical turn.
+    append_jsonl(transcript, [
+        make_assistant_row("assistant-2", "msg-2",
+                           [{"type": "text", "text": "Part two (continuation)."}], "2026-01-01T00:00:02.000Z"),
+    ])
+    turns, state = hook_module.get_new_turns_from_transcript(transcript, state)
+    assert hook_module.get_turns_to_emit(turns, state) == []
+
+    # A new user row closes turn 1 -> emitted with BOTH parts.
+    append_jsonl(transcript, [
+        make_user_row("user-2", "Next.", "2026-01-01T00:01:00.000Z"),
+        make_assistant_row("assistant-3", "msg-3",
+                           [{"type": "text", "text": "Second answer."}], "2026-01-01T00:01:01.000Z"),
+    ])
+    turns, state = hook_module.get_new_turns_from_transcript(transcript, state)
+    emitted = hook_module.get_turns_to_emit(turns, state)
+
+    assert len(emitted) == 1
+    assert emitted[0].user_msg["uuid"] == "user-1"
+    assert [m["message"]["id"] for m in emitted[0].assistant_msgs] == ["msg-1", "msg-2"]
+
+
+def test_async_turn_keeps_final_answer_arriving_after_notifications(hook_module, tmp_path):
+    """Regression (LFE-10747): an async-agent turn spans several Stop firings
+    (launch -> notification -> continuation); the post-notification assistant
+    rows carry the final answer and used to be dropped."""
+    transcript = tmp_path / "transcript.jsonl"
+    state = hook_module.SessionState()
+
+    def run(flush=False):
+        turns, _ = hook_module.get_new_turns_from_transcript(
+            transcript, state, flush_deferred_agent_turns=flush)
+        return hook_module.get_turns_to_emit(turns, state, flush_deferred_agent_turns=flush)
+
+    # Stop #1: launch turn ("agents are running...").
+    append_jsonl(transcript, launch_turn_rows("toolu_bg"))
+    assert run() == []
+
+    # Stop #2: notification plus Claude's continuation with the real answer.
+    append_jsonl(transcript, [
+        make_notification_row("notif-1", "toolu_bg", "Agent result.", "2026-01-01T00:01:00.000Z"),
+        make_assistant_row("assistant-3", "msg-3",
+                           [{"type": "text", "text": "Final answer based on the agent result."}],
+                           "2026-01-01T00:01:01.000Z"),
+    ])
+    assert run() == []
+
+    flushed = run(flush=True)
+
+    assert len(flushed) == 1
+    turn = flushed[0]
+    assert turn.user_msg["uuid"] == "user-1"
+    # launch message, "running" message, AND the post-notification answer
+    assert [m["message"]["id"] for m in turn.assistant_msgs] == ["msg-1", "msg-2", "msg-3"]
+    assert turn.tool_results_by_id["toolu_bg"]["final_content"] == "Agent result."
+
+
+def test_session_state_round_trips_open_turn(hook_module):
+    rows = launch_turn_rows("toolu_bg")
+    open_turn = {"user_row_uuid": "user-1", "rows": rows,
+                 "emitted_keys": ["msg-1"], "root_span_id": "a3f9c2d1e5b70468"}
+    state = hook_module.SessionState(open_turn=open_turn)
+    global_state: dict[str, Any] = {}
+
+    hook_module.update_session_state(global_state, "key", state)
+    restored = hook_module.get_session_state(global_state, "key")
+
+    assert restored.open_turn == open_turn
+
+
+def test_stashed_notification_reaches_still_open_turn_at_session_end(hook_module, tmp_path):
+    """Regression: if no further user turn ever closes the launch turn, the
+    stashed notification must still attach to it during the SessionEnd flush
+    instead of being discarded alongside an incomplete turn."""
+    transcript = tmp_path / "transcript.jsonl"
+    state = hook_module.SessionState()
+
+    def run(flush=False):
+        sub_map = hook_module.get_subagent_transcripts_by_tool_use_id(transcript)
+        turns, _ = hook_module.get_new_turns_from_transcript(
+            transcript, state, sub_map, flush_deferred_agent_turns=flush)
+        return hook_module.get_turns_to_emit(turns, state, flush_deferred_agent_turns=flush)
+
+    append_jsonl(transcript, launch_turn_rows("toolu_bg"))
+    assert run() == []
+
+    # task-id-only notification, meta.json not on disk yet -> stashed
+    append_jsonl(transcript, [
+        make_task_id_notification_row("n1", "agent-late", "Late result.", "2026-01-01T00:01:00.000Z"),
+    ])
+    assert run() == []
+    assert len(state.pending_task_notifications) == 1
+
+    # meta.json appears, but the user never writes again: SessionEnd must
+    # deliver the stashed result to the still-open turn.
+    write_subagent_meta(transcript, "agent-late", "toolu_bg")
+    flushed = run(flush=True)
+
+    assert len(flushed) == 1
+    assert flushed[0].user_msg["uuid"] == "user-1"
+    assert flushed[0].tool_results_by_id["toolu_bg"]["final_content"] == "Late result."
+    assert state.pending_task_notifications == []
+    assert state.open_turn == {}
