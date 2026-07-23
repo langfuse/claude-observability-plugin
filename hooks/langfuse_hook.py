@@ -15,6 +15,7 @@ import logging
 import os
 import random
 import sys
+import subprocess
 import threading
 import time
 import hashlib
@@ -40,6 +41,17 @@ def _opt(name: str) -> str:
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
+CUSTOM_TAG_COMMAND = _opt("CC_LANGFUSE_TAG_COMMAND")
+SESSION_LABEL_COMMAND = _opt("CC_LANGFUSE_SESSION_LABEL_COMMAND")
+SESSION_LABEL_MODE = (_opt("CC_LANGFUSE_SESSION_LABEL_MODE") or "prefix").lower()
+try:
+    CUSTOM_TAG_TIMEOUT = float(_opt("CC_LANGFUSE_TAG_TIMEOUT") or "2")
+except ValueError:
+    CUSTOM_TAG_TIMEOUT = 2.0
+# Bounds so a slow or chatty command can never degrade tracing.
+MAX_CUSTOM_TAGS = 20
+MAX_CUSTOM_TAG_LEN = 64
+MAX_SESSION_ID_LEN = 199  # Langfuse session id length limit
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
@@ -1437,6 +1449,104 @@ def short_session_label(session_id: str, max_len: int = 12) -> str:
 def trace_display_name(session_id: str, turn_num: int) -> str:
     return f"Claude Code - Turn {turn_num} ({short_session_label(session_id)})"
 
+_custom_tags_cache: Optional[List[str]] = None
+_session_label_cache: Optional[str] = None
+
+
+def _run_tag_command(cmd: str, what: str) -> Optional[str]:
+    """Run a user tag/label command, returning stdout or None. Fail-open."""
+    try:
+        proc = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=CUSTOM_TAG_TIMEOUT,
+        )
+    except Exception as e:
+        debug(f"{what} command failed: {e!r}")
+        return None
+    if proc.returncode != 0:
+        debug(f"{what} command exited {proc.returncode}: {proc.stderr.strip()[:200]}")
+        return None
+    return proc.stdout
+
+
+def collect_custom_tags() -> List[str]:
+    """Return extra tags from the user-configured CC_LANGFUSE_TAG_COMMAND.
+
+    The command is run once per hook invocation; each non-empty stdout line
+    becomes one tag. This is the supported extension point for attributing
+    traces to whatever a project cares about -- a git branch, a ticket id, a
+    CI run, a cost center -- without editing this hook.
+
+    Fail-open in every direction: no command, a non-zero exit, a timeout, or a
+    crash yields no tags and never interrupts tracing. Output is bounded so a
+    misbehaving command cannot flood a trace with tags.
+    """
+    global _custom_tags_cache
+    if _custom_tags_cache is not None:
+        return _custom_tags_cache
+    _custom_tags_cache = []
+    if not CUSTOM_TAG_COMMAND:
+        return _custom_tags_cache
+    out = _run_tag_command(CUSTOM_TAG_COMMAND, "custom tag")
+    if out is None:
+        return _custom_tags_cache
+    tags: List[str] = []
+    for line in out.splitlines():
+        tag = line.strip()
+        if tag:
+            tags.append(tag[:MAX_CUSTOM_TAG_LEN])
+        if len(tags) >= MAX_CUSTOM_TAGS:
+            break
+    _custom_tags_cache = tags
+    return _custom_tags_cache
+
+
+def resolve_session_label() -> str:
+    """First non-empty stdout line of CC_LANGFUSE_SESSION_LABEL_COMMAND, or ''.
+
+    Cached per process and fail-open. The same script can serve both this and
+    CC_LANGFUSE_TAG_COMMAND: tags use every line, the label uses the first.
+    """
+    global _session_label_cache
+    if _session_label_cache is not None:
+        return _session_label_cache
+    _session_label_cache = ""
+    if not SESSION_LABEL_COMMAND:
+        return _session_label_cache
+    out = _run_tag_command(SESSION_LABEL_COMMAND, "session label")
+    if out is None:
+        return _session_label_cache
+    for line in out.splitlines():
+        label = line.strip()
+        if label:
+            _session_label_cache = label[:MAX_CUSTOM_TAG_LEN]
+            break
+    return _session_label_cache
+
+
+def apply_session_label(session_id: str) -> str:
+    """Group a label's turns into one Langfuse session by relabeling session_id.
+
+    Modes (CC_LANGFUSE_SESSION_LABEL_MODE):
+      prefix   -> "<label>/<session_id>"  (default; one Langfuse session per
+                  Claude session, grouped under the label)
+      collapse -> "<label>"               (every session sharing a label merges
+                  into one Langfuse session)
+      off      -> unchanged
+
+    Returns session_id unchanged when the mode is off or no label resolves.
+    Affects only the trace's grouping id -- the incremental-read state key stays
+    keyed on the raw session id, so relabeling never re-emits past turns.
+    """
+    if SESSION_LABEL_MODE == "off":
+        return session_id
+    label = resolve_session_label()
+    if not label:
+        return session_id
+    if SESSION_LABEL_MODE == "collapse":
+        return label[:MAX_SESSION_ID_LEN]
+    return f"{label}/{session_id}"[:MAX_SESSION_ID_LEN]
+
+
 def get_trace_tags(
     turn: Turn,
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -1445,7 +1555,10 @@ def get_trace_tags(
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
         tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
-    return tags
+    tags += collect_custom_tags()
+    # De-dup, order-preserving: a custom command may re-emit an existing tag.
+    seen: set = set()
+    return [t for t in tags if not (t in seen or seen.add(t))]
 
 # ---- Generation payloads ----
 def build_generation_input(
@@ -2420,8 +2533,12 @@ def emit_new_turns_from_transcript(
     session_id: str,
     transcript_path: Path,
     *,
+    trace_session_id: Optional[str] = None,
     flush_deferred_agent_turns: bool = False,
 ) -> int:
+    # State/offset tracking keys off the raw session_id; the trace groups under
+    # trace_session_id (which may carry a story label). Defaults to raw.
+    trace_session_id = trace_session_id or session_id
     with FileLock(LOCK_FILE):
         state = load_hook_state()
         key = get_session_state_key(session_id, str(transcript_path))
@@ -2463,7 +2580,7 @@ def emit_new_turns_from_transcript(
         # then its rows keep being held and nothing is emitted.
         emit_ready_observations_of_open_turn(
             langfuse,
-            session_id,
+            trace_session_id,
             transcript_path,
             session_state,
             get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
@@ -2517,6 +2634,7 @@ def main() -> int:
         return 0
 
     session_id, transcript_path = hook_context
+    trace_session_id = apply_session_label(session_id)
     flush_deferred_agent_turns = is_session_end_hook_payload(payload)
 
     langfuse = create_langfuse_client(config)
@@ -2529,6 +2647,7 @@ def main() -> int:
             config,
             session_id,
             transcript_path,
+            trace_session_id=trace_session_id,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
         )
 

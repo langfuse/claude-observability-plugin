@@ -145,6 +145,50 @@ For how Langfuse Cloud handles data it receives, see the Langfuse privacy policy
 https://langfuse.com/privacy . When using a self-hosted Langfuse instance, your data
 stays within your own infrastructure.
 
+## Custom tags
+
+Set `CC_LANGFUSE_TAG_COMMAND` to a shell command and every trace gets tagged with each
+non-empty line the command prints to stdout. Use it to attribute traces to whatever your
+team tracks — a git branch, a ticket, a CI run, a cost center — without editing the hook.
+
+```bash
+CC_LANGFUSE_TAG_COMMAND='~/bin/langfuse-tags.sh'
+```
+
+```bash
+#!/usr/bin/env bash
+# ~/bin/langfuse-tags.sh — tag traces with the ticket id on the current branch
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0
+[[ $branch =~ [sS][cC]-([0-9]+) ]] && { echo "sc-${BASH_REMATCH[1]}"; echo "layer:build"; }
+```
+
+The command runs once per hook run (its result applies to every turn emitted in that run,
+so within a session the tags stay stable). It's fail-open — a missing command, a non-zero
+exit, a timeout, or a crash simply adds no tags and never interrupts tracing — and bounded:
+`CC_LANGFUSE_TAG_TIMEOUT` seconds (default 2), at most 20 tags of 64 characters each.
+Because the logic lives in your own script, it survives plugin updates.
+
+### Grouping sessions by a label
+
+`CC_LANGFUSE_SESSION_LABEL_COMMAND` takes the first non-empty line of a command's stdout and
+uses it to group a session's traces in Langfuse — so, for example, all Claude Code work on
+one ticket lands under one grouping key.
+
+```bash
+CC_LANGFUSE_SESSION_LABEL_COMMAND='~/bin/langfuse-tags.sh'   # first line = the label
+CC_LANGFUSE_SESSION_LABEL_MODE='prefix'                      # prefix | collapse | off
+```
+
+- `prefix` (default): session id becomes `<label>/<session>` — one Langfuse session per
+  Claude session, grouped under the label.
+- `collapse`: every session sharing a label merges into a single Langfuse session.
+- `off`: disabled.
+
+The same script can drive both features — `CC_LANGFUSE_TAG_COMMAND` uses every line as a tag,
+`CC_LANGFUSE_SESSION_LABEL_COMMAND` uses the first line as the label. Point both at one script
+that prints the ticket id on line 1. Labeling affects only trace grouping; the incremental-read
+state stays keyed on the raw session id, so it never re-emits past turns.
+
 ## Reconfigure
 
 In Claude Code, run:
