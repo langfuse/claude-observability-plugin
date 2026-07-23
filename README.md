@@ -42,6 +42,7 @@ The plugin requires or accepts:
 | `CC_LANGFUSE_SKILL_TAGS` | Tag traces with `skill:<name>` for every skill invoked in the turn (default true).                 |
 | `CC_LANGFUSE_CAPTURE_SKILL_CONTENT` | Include injected skill instruction text in the Skill tool span output (default false).  |
 | `CC_LANGFUSE_TRACE_SEED` | Optional. Opt-in seed for deterministic trace IDs — see [Deterministic trace IDs](#deterministic-trace-ids). |
+| `CC_LANGFUSE_TAGS` | Optional. Comma-separated custom tags appended to every trace (e.g. `env:prod,team:platform`). |
 
 Get keys from your Langfuse project settings → API Keys.
 

@@ -39,6 +39,7 @@ def _opt(name: str) -> str:
 
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
+CUSTOM_TAGS = [t.strip() for t in _opt("CC_LANGFUSE_TAGS").split(",") if t.strip()]
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
@@ -1441,7 +1442,7 @@ def get_trace_tags(
     turn: Turn,
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[str]:
-    tags = ["claude-code"]
+    tags = ["claude-code"] + CUSTOM_TAGS
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
         tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
