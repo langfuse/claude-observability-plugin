@@ -36,8 +36,29 @@ def _opt(name: str) -> str:
     """
     return os.environ.get(name) or os.environ.get(f"CLAUDE_PLUGIN_OPTION_{name}") or ""
 
+def parse_custom_tags(raw: str) -> Tuple[List[str], str]:
+    """Parse CC_LANGFUSE_TAGS into a de-duplicated tag list.
+
+    Comma-separated; tokens are stripped and empty ones dropped, so "a, b,,c,"
+    yields ["a", "b", "c"]. Order is preserved and repeats collapse onto their
+    first occurrence. Interior whitespace is kept, so "phase:review pass 2"
+    stays a single tag.
+
+    Returns (tags, warning). The warning is returned rather than logged because
+    this runs at import time, before the logger exists; main() emits it next to
+    the state-dir warning, the same shape _resolve_state_dir already uses.
+    """
+    tags: List[str] = []
+    for token in raw.split(","):
+        tag = token.strip()
+        if not tag or tag in tags:
+            continue
+        tags.append(tag)
+    return tags, ""
+
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
+CUSTOM_TAGS, _CUSTOM_TAGS_WARNING = parse_custom_tags(_opt("CC_LANGFUSE_TAGS"))
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
 try:
@@ -1754,11 +1775,15 @@ def get_trace_tags(
     turn: Turn,
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[str]:
-    tags = ["claude-code"]
+    # Operator tags come before the data-derived ones so every trace of a run shares
+    # a stable prefix, and they sit outside the SKILL_TAGS gate: turning skill tags
+    # off should not discard labels the launching process asked for.
+    tags = ["claude-code"] + CUSTOM_TAGS
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
         tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
-    return tags
+    # A custom tag may repeat "claude-code" or a skill tag; keep its first position.
+    return list(dict.fromkeys(tags))
 
 # ---- Generation payloads ----
 def build_generation_input(
@@ -2749,6 +2774,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         # Attached mode: trace name, session, user and tags are trace-level
         # fields owned by the launching application's trace — propagating
         # them would overwrite the application's own values server-side.
+        # This drops CC_LANGFUSE_TAGS too: a caller able to set a parent trace
+        # context is already a Langfuse client and can tag its own trace.
         attribute_propagation = contextlib.nullcontext()
     with attribute_propagation:
         trace_span = None
