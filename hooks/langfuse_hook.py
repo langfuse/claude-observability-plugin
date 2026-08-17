@@ -36,8 +36,14 @@ def _opt(name: str) -> str:
     """
     return os.environ.get(name) or os.environ.get(f"CLAUDE_PLUGIN_OPTION_{name}") or ""
 
+# Bounds for operator-supplied tags. 200 mirrors the SDK's own per-tag limit, so a
+# tag this hook accepts is never dropped again downstream, and one it rejects is
+# reported in this hook's log instead of vanishing into the SDK's logger.
+MAX_CUSTOM_TAGS = 20
+MAX_CUSTOM_TAG_CHARS = 200
+
 def parse_custom_tags(raw: str) -> Tuple[List[str], str]:
-    """Parse CC_LANGFUSE_TAGS into a de-duplicated tag list.
+    """Parse CC_LANGFUSE_TAGS into a bounded, de-duplicated tag list.
 
     Comma-separated; tokens are stripped and empty ones dropped, so "a, b,,c,"
     yields ["a", "b", "c"]. Order is preserved and repeats collapse onto their
@@ -49,12 +55,22 @@ def parse_custom_tags(raw: str) -> Tuple[List[str], str]:
     the state-dir warning, the same shape _resolve_state_dir already uses.
     """
     tags: List[str] = []
+    too_long = 0
     for token in raw.split(","):
         tag = token.strip()
         if not tag or tag in tags:
             continue
+        if len(tag) > MAX_CUSTOM_TAG_CHARS:
+            too_long += 1
+            continue
         tags.append(tag)
-    return tags, ""
+    notes: List[str] = []
+    if too_long:
+        notes.append(f"{too_long} over {MAX_CUSTOM_TAG_CHARS} chars")
+    if len(tags) > MAX_CUSTOM_TAGS:
+        notes.append(f"{len(tags) - MAX_CUSTOM_TAGS} past the {MAX_CUSTOM_TAGS}-tag limit")
+        tags = tags[:MAX_CUSTOM_TAGS]
+    return tags, (f"CC_LANGFUSE_TAGS: dropped {', '.join(notes)}" if notes else "")
 
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
@@ -3044,6 +3060,8 @@ def main() -> int:
 
     if _STATE_DIR_WARNING:
         info(_STATE_DIR_WARNING)
+    if _CUSTOM_TAGS_WARNING:
+        info(_CUSTOM_TAGS_WARNING)
 
     config = get_langfuse_config()
     if config is None:

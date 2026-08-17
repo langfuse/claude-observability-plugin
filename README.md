@@ -46,7 +46,7 @@ The plugin requires or accepts:
 | `CC_LANGFUSE_TRACE_SEED` | Optional. Opt-in seed for deterministic trace IDs — see [Deterministic trace IDs](#deterministic-trace-ids). |
 | `CC_LANGFUSE_TRACEPARENT` | Optional, per run (env var, not plugin config). W3C traceparent of an existing trace to attach to — see [Attach runs to an existing trace](#attach-runs-to-an-existing-trace). |
 | `CC_LANGFUSE_PARENT_TRACE_ID` / `CC_LANGFUSE_PARENT_SPAN_ID` | Optional, per run. Explicit alternative to `CC_LANGFUSE_TRACEPARENT` (32-hex trace id + 16-hex span id). |
-| `CC_LANGFUSE_TAGS` | Optional, per run (env var, not plugin config). Comma-separated tags added to every trace, e.g. `env:prod,team:platform`. Blank entries and duplicates are ignored. Not applied in attached mode — see [Attach runs to an existing trace](#attach-runs-to-an-existing-trace). |
+| `CC_LANGFUSE_TAGS` | Optional, per run (env var, not plugin config). Comma-separated tags added to every trace, e.g. `env:prod,team:platform`. Blank entries and duplicates are ignored; tags over 200 characters, and anything past the first 20, are dropped with a log line. Not applied in attached mode — see [Attach runs to an existing trace](#attach-runs-to-an-existing-trace). |
 
 Get keys from your Langfuse project settings → API Keys.
 
