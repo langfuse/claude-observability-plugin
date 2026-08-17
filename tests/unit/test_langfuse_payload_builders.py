@@ -111,6 +111,7 @@ def test_trace_metadata_includes_session_turn_project_and_branch(
     assert metadata["session_id"] == "12345678-abcd-4000-8000-123456789abc"
     assert metadata["turn_number"] == 7
     assert metadata["transcript_path"] == "transcript.jsonl"
+    assert metadata["project"] == "repo"
     assert metadata["cwd"] == "/repo"
     assert metadata["git_branch"] == "feature/test"
 

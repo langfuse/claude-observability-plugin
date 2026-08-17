@@ -2585,6 +2585,8 @@ def build_trace_metadata(
         value = turn.user_msg.get(src_key)
         if isinstance(value, str) and value:
             trace_metadata[dst_key] = value
+            if src_key == "cwd":
+                trace_metadata["project"] = Path(value).name
     return trace_metadata
 
 def is_valid_span_id_hex(span_id: Any) -> bool:
