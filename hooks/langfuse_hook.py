@@ -38,6 +38,19 @@ def _opt(name: str) -> str:
 
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
+
+
+def _parse_tags(raw: str) -> List[str]:
+    """Split a comma-separated tag list, dropping blanks and duplicates, keeping order."""
+    out: List[str] = []
+    for part in raw.split(","):
+        tag = part.strip()
+        if tag and tag not in out:
+            out.append(tag)
+    return out
+
+
+EXTRA_TAGS = _parse_tags(_opt("CC_LANGFUSE_TAGS"))
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
 try:
@@ -1783,6 +1796,9 @@ def get_trace_tags(
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[str]:
     tags = ["claude-code"]
+    for tag in EXTRA_TAGS:
+        if tag not in tags:
+            tags.append(tag)
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
         tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
