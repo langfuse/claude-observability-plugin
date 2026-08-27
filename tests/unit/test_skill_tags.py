@@ -2,6 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_custom_tags(hook_module, monkeypatch):
+    """hook_module is session-scoped, so CUSTOM_TAGS froze at import from the
+    developer's own environment. Reset it per test; cases that want custom tags
+    set them explicitly with monkeypatch.setattr (setenv would have no effect)."""
+    monkeypatch.setattr(hook_module, "CUSTOM_TAGS", [])
+
 
 def make_user_row(text: str) -> dict[str, Any]:
     return {
@@ -172,3 +182,83 @@ def test_same_skill_across_two_subagents_is_tagged_once(hook_module, tmp_path):
     assert hook_module.collect_subagent_skill_tags(turns[0], sub_map) == [
         "subagent-skill:deep-research",
     ]
+
+
+# --- Operator tags from CC_LANGFUSE_TAGS -------------------------------------
+# hook_module is session-scoped, so CUSTOM_TAGS cannot be driven with setenv;
+# these set the parsed value directly, which is what the hook reads.
+
+
+def make_plain_assistant_row() -> dict[str, Any]:
+    """An assistant turn that invokes no skill, so only custom tags can appear."""
+    return {
+        "type": "assistant",
+        "timestamp": "2026-01-01T00:00:03.000Z",
+        "uuid": "assistant-plain",
+        "message": {
+            "id": "msg-plain",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": "No skill was used here."}],
+        },
+    }
+
+
+def trace_tags(hook_module, rows: list[dict[str, Any]]) -> list[str]:
+    turns = hook_module.build_turns(rows)
+    assert len(turns) == 1
+    return hook_module.get_trace_tags(turns[0])
+
+
+def test_custom_tags_follow_the_base_tag(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CUSTOM_TAGS", ["env:prod"])
+
+    assert trace_tags(hook_module, [
+        make_user_row("Hello."),
+        make_plain_assistant_row(),
+    ]) == ["claude-code", "env:prod"]
+
+
+def test_custom_tags_precede_skill_tags(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CUSTOM_TAGS", ["env:prod"])
+
+    assert trace_tags(hook_module, [
+        make_user_row("Use a skill."),
+        make_skill_tool_use_row("claude-api"),
+    ]) == ["claude-code", "env:prod", "skill:claude-api"]
+
+
+def test_no_custom_tags_leaves_trace_tags_unchanged(hook_module):
+    assert trace_tags(hook_module, [
+        make_user_row("Hello."),
+        make_plain_assistant_row(),
+    ]) == ["claude-code"]
+
+
+def test_custom_tags_apply_when_skill_tags_are_disabled(hook_module, monkeypatch):
+    """CC_LANGFUSE_SKILL_TAGS=false must not discard operator-supplied labels."""
+    monkeypatch.setattr(hook_module, "CUSTOM_TAGS", ["env:prod"])
+    monkeypatch.setattr(hook_module, "SKILL_TAGS", False)
+
+    assert trace_tags(hook_module, [
+        make_user_row("Use a skill."),
+        make_skill_tool_use_row("claude-api"),
+    ]) == ["claude-code", "env:prod"]
+
+
+def test_custom_tag_duplicating_a_skill_tag_appears_once(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CUSTOM_TAGS", ["skill:claude-api"])
+
+    assert trace_tags(hook_module, [
+        make_user_row("Use a skill."),
+        make_skill_tool_use_row("claude-api"),
+    ]) == ["claude-code", "skill:claude-api"]
+
+
+def test_custom_tag_duplicating_the_base_tag_appears_once(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CUSTOM_TAGS", ["claude-code"])
+
+    assert trace_tags(hook_module, [
+        make_user_row("Hello."),
+        make_plain_assistant_row(),
+    ]) == ["claude-code"]

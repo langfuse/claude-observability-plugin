@@ -26,6 +26,12 @@ def clean_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
             f"CLAUDE_PLUGIN_OPTION_CC_{name}",
         ):
             monkeypatch.delenv(key, raising=False)
+    for key in (
+        "LANGFUSE_TAGS",
+        "CC_LANGFUSE_TAGS",
+        "CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_TAGS",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 def _read_log(hook_module: Any) -> str:
@@ -184,3 +190,28 @@ def test_env_keys_with_code_default_host_do_not_warn(hook_module: Any, monkeypat
     assert config.host == "https://cloud.langfuse.com"
     assert config.user_id is None
     assert "mixed-source" not in _read_log(hook_module)
+
+
+# ----------------- CC_LANGFUSE_TAGS: _opt, not _core_opt -----------------
+
+def test_custom_tags_env_var_wins_over_wizard_option(hook_module: Any, monkeypatch):
+    monkeypatch.setenv("CC_LANGFUSE_TAGS", "env:repo")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_TAGS", "env:machine")
+
+    assert hook_module._opt("CC_LANGFUSE_TAGS") == "env:repo"
+
+
+def test_custom_tags_fall_through_to_wizard_when_env_is_empty(hook_module: Any, monkeypatch):
+    monkeypatch.setenv("CC_LANGFUSE_TAGS", "")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_TAGS", "env:machine")
+
+    assert hook_module._opt("CC_LANGFUSE_TAGS") == "env:machine"
+
+
+def test_bare_langfuse_tags_env_var_is_not_read(hook_module: Any, monkeypatch):
+    """CC_LANGFUSE_TAGS resolves through _opt, not _core_opt, so the un-prefixed
+    LANGFUSE_TAGS is deliberately not claimed — the Langfuse SDK does not define
+    it, and taking the name would be a namespace land-grab."""
+    monkeypatch.setenv("LANGFUSE_TAGS", "env:bare")
+
+    assert hook_module._opt("CC_LANGFUSE_TAGS") == ""
