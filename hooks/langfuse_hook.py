@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import socket
 import sys
 import threading
 import time
@@ -1953,6 +1954,18 @@ def get_tool_result_for_observation(tool_result_entry: Any) -> ToolResultForObse
         final_result_timestamp=final_result_timestamp,
     )
 
+def get_hostname_for_metadata() -> Optional[str]:
+    """The machine this trace is emitted from, or None if it cannot be read.
+
+    Deliberately never raises. A trace missing a hostname is worth more than a
+    hook that dies while building metadata, and this runs on every turn.
+    """
+    try:
+        return socket.gethostname() or None
+    except OSError:
+        return None
+
+
 def get_short_transcript_path_for_metadata(path: Any) -> Optional[str]:
     if isinstance(path, Path):
         return path.name
@@ -2666,6 +2679,19 @@ def build_trace_metadata(
         value = turn.user_msg.get(src_key)
         if isinstance(value, str) and value:
             trace_metadata[dst_key] = value
+    # ...and the same goal needs the machine, because a project path is not
+    # unique across hosts: two machines sharing a checkout layout produce
+    # byte-identical `cwd`, so their traces are indistinguishable in Langfuse.
+    #
+    # Read at hook time, not from the transcript, because transcript rows carry
+    # no host field. So this names the host that EMITTED the trace -- the host
+    # that ran the session in the normal case, but NOT when a stored transcript
+    # is re-processed elsewhere (a backfill, or one copied to another machine
+    # for debugging). If Claude Code ever records a host in the transcript,
+    # prefer that and keep this as the fallback.
+    hostname = get_hostname_for_metadata()
+    if hostname:
+        trace_metadata["hostname"] = hostname
     return trace_metadata
 
 def is_valid_span_id_hex(span_id: Any) -> bool:
