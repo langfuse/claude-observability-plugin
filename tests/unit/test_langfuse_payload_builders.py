@@ -115,6 +115,66 @@ def test_trace_metadata_includes_session_turn_project_and_branch(
     assert metadata["git_branch"] == "feature/test"
 
 
+def test_trace_metadata_names_the_emitting_host(
+    hook_module,
+    fixture_transcript_path,
+    read_fixture_jsonl,
+):
+    """`cwd` alone cannot separate two machines that share a checkout layout.
+
+    Two hosts with the same project path emit byte-identical `cwd`, so their
+    traces are indistinguishable in Langfuse -- which defeats the stated goal
+    of the sibling fields above on any multi-machine setup.
+    """
+    import socket
+
+    rows = read_fixture_jsonl(fixture_transcript_path("simple_turn"))
+    turn = hook_module.build_turns(rows)[0]
+
+    metadata = hook_module.build_trace_metadata(
+        "12345678-abcd-4000-8000-123456789abc",
+        7,
+        turn,
+        fixture_transcript_path("simple_turn"),
+        {"truncated": False},
+    )
+
+    assert metadata["hostname"] == socket.gethostname()
+
+
+def test_trace_metadata_survives_an_unreadable_hostname(
+    hook_module,
+    fixture_transcript_path,
+    read_fixture_jsonl,
+    monkeypatch,
+):
+    """A hostname that cannot be read must cost the field, never the trace.
+
+    This runs on every turn, so an exception here would take out observability
+    entirely rather than degrade it. Watched failing: without the guard in
+    `get_hostname_for_metadata`, this test raises instead of skipping the key.
+    """
+    monkeypatch.setattr(
+        hook_module.socket,
+        "gethostname",
+        lambda: (_ for _ in ()).throw(OSError("no hostname")),
+    )
+
+    rows = read_fixture_jsonl(fixture_transcript_path("simple_turn"))
+    turn = hook_module.build_turns(rows)[0]
+
+    metadata = hook_module.build_trace_metadata(
+        "12345678-abcd-4000-8000-123456789abc",
+        7,
+        turn,
+        fixture_transcript_path("simple_turn"),
+        {"truncated": False},
+    )
+
+    assert "hostname" not in metadata
+    assert metadata["cwd"] == "/repo"
+
+
 def test_async_final_result_reaches_generation_input_despite_tool_batch(
     hook_module,
     fake_langfuse,
