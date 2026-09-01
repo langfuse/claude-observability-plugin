@@ -3,6 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "langfuse>=4.7,<5",
+#   "httpx[socks]",
 # ]
 # ///
 """
