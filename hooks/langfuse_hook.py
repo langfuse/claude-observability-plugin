@@ -1912,10 +1912,13 @@ def build_generation_output(assistant_text: str, tool_uses: List[Dict[str, Any]]
     if thinking_parts:
         output["thinking"] = thinking_parts
     if tool_uses:
+        # Langfuse renders tool calls only in this nested shape. A flat
+        # id and name pair stays raw JSON in the trace UI.
         output["tool_calls"] = [
             {
                 "id": tool_use.get("id"),
-                "name": tool_use.get("name"),
+                "type": "function",
+                "function": {"name": tool_use.get("name")},
             }
             for tool_use in tool_uses
         ]

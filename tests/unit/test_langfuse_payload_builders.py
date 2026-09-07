@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 
 def test_generation_input_tracks_user_tool_and_async_tool_contexts(hook_module):
     assert hook_module.build_generation_input(0, "hello", [], []) == {
@@ -48,8 +50,37 @@ def test_generation_output_lists_tool_calls_without_full_tool_input(hook_module)
     assert output == {
         "role": "assistant",
         "content": "I will read it.",
-        "tool_calls": [{"id": "toolu_read", "name": "Read"}],
+        "tool_calls": [
+            {"id": "toolu_read", "type": "function", "function": {"name": "Read"}}
+        ],
     }
+    assert "README.md" not in json.dumps(output)
+
+
+def test_generation_output_keeps_the_order_of_parallel_tool_calls(hook_module):
+    output = hook_module.build_generation_output(
+        "",
+        [
+            {"id": "toolu_a", "name": "Bash", "input": {"command": "ls"}},
+            {"id": "toolu_b", "name": "Read", "input": {"file_path": "a.py"}},
+        ],
+    )
+
+    assert output == {
+        "role": "assistant",
+        "tool_calls": [
+            {"id": "toolu_a", "type": "function", "function": {"name": "Bash"}},
+            {"id": "toolu_b", "type": "function", "function": {"name": "Read"}},
+        ],
+    }
+
+
+def test_generation_output_of_malformed_tool_use_keeps_the_nested_shape(hook_module):
+    output = hook_module.build_generation_output("", [{}])
+
+    assert output["tool_calls"] == [
+        {"id": None, "type": "function", "function": {"name": None}}
+    ]
 
 
 def test_tool_result_payload_preserves_initial_and_final_async_outputs(hook_module):
