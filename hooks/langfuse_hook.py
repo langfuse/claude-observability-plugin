@@ -1388,15 +1388,71 @@ def assign_turn_numbers(turns: List[Turn], trailing_turn: Optional[Turn],
             next_turn_number += 1
 
 
+def is_row_from_another_session(row: Dict[str, Any], session_id: str) -> bool:
+    """True if the row is not from the current session."""
+    row_session_id = row.get("sessionId")
+    return (
+        isinstance(row_session_id, str)
+        and bool(row_session_id)
+        and row_session_id != session_id
+    )
+
+
+def transcript_file_belongs_to_session(transcript_path: Path, session_id: str) -> bool:
+    """True if the transcript file has the name of the current session.
+
+    Claude Code gives each transcript file the name of its session id. A
+    different name shows that the payload and the rows do not agree.
+    """
+    return transcript_path.stem == session_id
+
+
+def drop_rows_copied_from_another_session(
+    rows: List[Dict[str, Any]],
+    session_id: str,
+    session_state: SessionState,
+    task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Remove the rows that a fork copied from its original session.
+
+    The original session exported these turns before. The number of the removed
+    turns increases the turn count. Then the later turns keep unique numbers.
+    """
+    copied = [row for row in rows if is_row_from_another_session(row, session_id)]
+    if not copied:
+        return rows
+
+    copied_turns = len(build_turns(copied, task_id_to_tool_use_id))
+    session_state.turn_count = max(session_state.turn_count, copied_turns)
+    info(
+        f"Skipped {len(copied)} row(s) of history copied from another session "
+        f"({copied_turns} turn(s) already exported by it)"
+    )
+    return [row for row in rows if not is_row_from_another_session(row, session_id)]
+
+
 def get_new_turns_from_transcript(
     transcript_path: Path,
     session_state: SessionState,
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
     *,
     flush_deferred_agent_turns: bool = False,
+    session_id: Optional[str] = None,
 ) -> Tuple[List[Turn], SessionState]:
     rows, session_state = read_new_jsonl(transcript_path, session_state)
     task_id_to_tool_use_id = get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id)
+
+    if session_id and rows:
+        if transcript_file_belongs_to_session(transcript_path, session_id):
+            rows = drop_rows_copied_from_another_session(
+                rows, session_id, session_state, task_id_to_tool_use_id
+            )
+        else:
+            # Keeping duplicates as fallback.
+            debug(
+                f"transcript {transcript_path.name} is not named after session "
+                f"{session_id}; not checking for copied history"
+            )
 
     # Re-attach the trailing open turn from the previous run. Stop fires
     # multiple times within one logical turn, so a batch can begin with
@@ -3206,6 +3262,7 @@ def emit_new_turns_from_transcript(
             session_state,
             subagent_transcripts_by_tool_use_id,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
+            session_id=session_id,
         )
 
         # One full-file pass per firing serves every turn emitted below.
