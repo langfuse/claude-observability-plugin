@@ -45,6 +45,10 @@ try:
 except ValueError:
     MAX_CHARS = 20000
 
+# Seconds to wait for the SDK flush before giving up; see resolve_flush_timeout().
+FLUSH_TIMEOUT_DEFAULT = 120.0
+FLUSH_TIMEOUT_MAX = 3600.0
+
 # Bound for unresolved task notifications kept in the state file between runs.
 MAX_PENDING_TASK_NOTIFICATIONS = 50
 
@@ -3322,11 +3326,46 @@ def emit_new_turns_from_transcript(
     return emitted
 
 
+def resolve_flush_timeout() -> float:
+    """Seconds to wait for the flush thread, from CC_LANGFUSE_FLUSH_TIMEOUT.
+
+    An unusable value falls back to the default and logs, the same way
+    CC_LANGFUSE_STATE_DIR does: silently skipping the wait would reintroduce
+    the very data loss this cap exists to bound.
+    """
+    raw = _opt("CC_LANGFUSE_FLUSH_TIMEOUT").strip()
+    if not raw:
+        return FLUSH_TIMEOUT_DEFAULT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        info(
+            f"CC_LANGFUSE_FLUSH_TIMEOUT {raw!r} is not a number; "
+            f"using the default {FLUSH_TIMEOUT_DEFAULT}s"
+        )
+        return FLUSH_TIMEOUT_DEFAULT
+    # Excludes NaN and inf as well as non-positive values: either would turn the
+    # cap into no cap, and `inf` would hang Claude Code on an unreachable host.
+    if not 0 < seconds <= FLUSH_TIMEOUT_MAX:
+        info(
+            f"CC_LANGFUSE_FLUSH_TIMEOUT {raw!r} is not a number of seconds between "
+            f"0 and {FLUSH_TIMEOUT_MAX}; using the default {FLUSH_TIMEOUT_DEFAULT}s"
+        )
+        return FLUSH_TIMEOUT_DEFAULT
+    return seconds
+
+
 def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
     if langfuse is None:
         return
 
-    # Cap flush+shutdown at 5s so a slow/unreachable Langfuse can't stall Claude Code.
+    # Cap flush+shutdown so a slow or unreachable Langfuse can't stall Claude
+    # Code indefinitely. The cap was a hard 5s, which is shorter than the OTLP
+    # upload of a large session (200+ turns): the join returned, the hook
+    # exited 0 reporting "Processed N turns", and every event of that session
+    # was dropped. Resolve the cap before the try, so a bad value falls back to
+    # the default instead of being swallowed into no wait at all.
+    timeout = resolve_flush_timeout()
     try:
         def _flush_and_shutdown():
             try:
@@ -3337,7 +3376,12 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
 
         t = threading.Thread(target=_flush_and_shutdown, daemon=True)
         t.start()
-        t.join(5.0)
+        t.join(timeout)
+        if t.is_alive():
+            info(
+                f"Langfuse flush did not finish within {timeout}s; events from this "
+                "session may be missing. Raise CC_LANGFUSE_FLUSH_TIMEOUT if this recurs."
+            )
     except Exception:
         pass
 

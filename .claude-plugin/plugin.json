@@ -63,6 +63,12 @@
       "description": "Upload images to Langfuse and show them in the trace. This includes pasted images and screenshots from tool results. Your Langfuse deployment must support media upload. Set to false to show short text markers instead.",
       "default": true
     },
+    "CC_LANGFUSE_FLUSH_TIMEOUT": {
+      "type": "number",
+      "title": "Flush timeout (seconds)",
+      "description": "How long the hook waits for the SDK to upload the turn's events before giving up. Long sessions need more than a few seconds; giving up early drops the whole session.",
+      "default": 120
+    },
     "CC_LANGFUSE_STATE_DIR": {
       "type": "string",
       "title": "State directory",

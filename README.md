@@ -103,6 +103,7 @@ value is a per-run environment variable.
 | `CC_LANGFUSE_SKILL_TAGS` | Tag traces with `skill:<name>` for every skill invoked in the turn (default `true`). | No |
 | `CC_LANGFUSE_CAPTURE_SKILL_CONTENT` | Include injected skill instruction text in the Skill tool span output (default `false`). | No |
 | `CC_LANGFUSE_CAPTURE_IMAGES` | Upload images to Langfuse and show them in the trace (default `true`). Needs media upload on your deployment (self-hosted: `LANGFUSE_S3_MEDIA_UPLOAD_*`). Set it to `false` if media upload is unavailable: the trace then shows a marker per image, such as `[image image/png ~200KB]`. | No |
+| `CC_LANGFUSE_FLUSH_TIMEOUT` | Seconds the hook waits for the SDK to upload the turn's events before giving up (default `120`). A long session produces a payload that takes far longer than a few seconds to upload, and giving up early drops the whole session silently — the hook now logs when it gives up. Lower it if you would rather an unreachable Langfuse never delay the end of a turn. An unusable value falls back to the default and logs. At `SessionEnd` Claude Code caps the wait at 60s regardless of this value (see below). | No |
 | `CC_LANGFUSE_STATE_DIR` | Absolute directory (`~` is expanded) for the hook's state, lock and log files (default `~/.claude/state`). Set one per `CLAUDE_CONFIG_DIR` installation to keep them apart. An unusable value falls back to the default and logs a warning. | No |
 | `CC_LANGFUSE_TRACE_SEED` | Seed that makes trace IDs predictable, so a headless caller can derive a run's trace ID before the trace exists. Use a unique seed per session, otherwise sessions collide on the same trace IDs. | No |
 | `CC_LANGFUSE_TRACEPARENT` | Per-run environment variable. W3C traceparent of an existing trace to attach to — see [Attach runs to an existing trace](#attach-runs-to-an-existing-trace). | No |
@@ -176,9 +177,26 @@ the newest lines against this table:
 | `Langfuse config incomplete: missing …` | The named keys did not reach the hook. Configure them with `/plugin configure`. If the line also says `loaded under plugin identity '@inline'`, see below. |
 | `Hook started` plus a skip reason | The hook ran and skipped on purpose, which is usual for background sessions. Report it with the log line if real turns are missing. |
 | `Processed N turns …` but nothing in Langfuse | Delivery failed after the SDK took the turns. Check `LANGFUSE_BASE_URL` (EU against US), key validity, and proxy reachability. |
+| `Langfuse flush did not finish within …s` | The upload was still running when the hook gave up, so some or all of that session's events never left the machine. Long sessions and slow links need longer: raise `CC_LANGFUSE_FLUSH_TIMEOUT`. |
 
 `Hook started` and other `[DEBUG]` lines need `CC_LANGFUSE_DEBUG`. The failure
 lines above are `[INFO]` and appear without it.
+
+### Long sessions and the flush window
+
+The hook hands the turn's events to the SDK and then waits for the upload,
+capped by `CC_LANGFUSE_FLUSH_TIMEOUT` (default 120s) so an unreachable Langfuse
+cannot stall Claude Code forever. A few hundred transcript rows produce an OTLP
+payload that takes well over a few seconds to ship, so a short cap loses whole
+sessions — silently before this was logged.
+
+`SessionEnd` has a second, tighter budget that this plugin does not control:
+Claude Code allows its `SessionEnd` hooks the longest `timeout` any of them
+declares, floored at 1.5s and **capped at 60s**. `hooks/hooks.json` therefore
+declares `"timeout": 60` on the `SessionEnd` entry to claim that whole ceiling;
+without it the window is 1.5s and nearly nothing gets uploaded at session end.
+`Stop` has no such ceiling, so it is where large sessions actually finish
+flushing. (Verified against Claude Code 2.1.263.)
 
 ### Desktop app (GUI) sessions
 
