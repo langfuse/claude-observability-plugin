@@ -40,13 +40,64 @@ DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
     MAX_CHARS = 20000
 
+MAX_OPERATOR_TAGS = 20
+MAX_OPERATOR_TAG_CHARS = 200
+
 # Bound for unresolved task notifications kept in the state file between runs.
 MAX_PENDING_TASK_NOTIFICATIONS = 50
+
+def parse_operator_tags(raw: str) -> Tuple[List[str], str]:
+    """Parse caller tags from a JSON array or a comma-separated list.
+
+    Returns the tags and a warning naming what was dropped. Bad input yields no
+    tags and a warning, never an exception: telemetry stays best-effort.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return [], ""
+    notes: List[str] = []
+    values: List[Any]
+    if raw.startswith("{"):
+        return [], f"{OPERATOR_TAGS_VAR}: ignored, JSON is not an array"
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return [], f"{OPERATOR_TAGS_VAR}: ignored, not valid JSON"
+        if not isinstance(parsed, list):
+            return [], f"{OPERATOR_TAGS_VAR}: ignored, JSON is not an array"
+        values = parsed
+    else:
+        values = raw.split(",")
+
+    tags: List[str] = []
+    for value in values:
+        if not isinstance(value, (str, int, float, bool)):
+            notes.append("non-scalar entries")
+            continue
+        tag = str(value).strip()
+        if not tag:
+            continue
+        if len(tag) > MAX_OPERATOR_TAG_CHARS:
+            notes.append(f"entries over {MAX_OPERATOR_TAG_CHARS} characters")
+            continue
+        if tag in tags:
+            continue
+        tags.append(tag)
+
+    if len(tags) > MAX_OPERATOR_TAGS:
+        notes.append(f"everything past the first {MAX_OPERATOR_TAGS}")
+        tags = tags[:MAX_OPERATOR_TAGS]
+    warning = f"{OPERATOR_TAGS_VAR}: dropped {', '.join(dict.fromkeys(notes))}" if notes else ""
+    return tags, warning
+
+OPERATOR_TAGS, _OPERATOR_TAGS_WARNING = parse_operator_tags(_opt(OPERATOR_TAGS_VAR))
 
 
 # ----------------- Paths -----------------
@@ -1920,6 +1971,7 @@ def get_trace_tags(
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
         tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
+    tags += [tag for tag in OPERATOR_TAGS if tag not in tags]
     return tags
 
 # ---- Generation payloads ----
@@ -3349,6 +3401,8 @@ def main() -> int:
 
     if _STATE_DIR_WARNING:
         info(_STATE_DIR_WARNING)
+    if _OPERATOR_TAGS_WARNING:
+        info(_OPERATOR_TAGS_WARNING)
 
     config = get_langfuse_config()
     if config is None:
