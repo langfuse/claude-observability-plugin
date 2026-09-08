@@ -1,0 +1,44 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify the tag and draft a GitHub release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate release version
+        run: |
+          manifest_version="$(python3 -c 'import json; print(json.load(open(".claude-plugin/plugin.json"))["version"])')"
+          if [[ "$GITHUB_REF_NAME" != "v$manifest_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match plugin.json version $manifest_version" >&2
+            exit 1
+          fi
+      - name: Setup uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Test
+        run: uv run --group dev pytest
+      - name: Run the hook with an empty payload
+        run: echo '{}' | uv run --script hooks/langfuse_hook.py
+      # Draft, so the notes get a human pass before anyone sees them.
+      - name: Create draft GitHub release
+        run: gh release create "$GITHUB_REF_NAME" --draft --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,36 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Check GitHub Actions
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "main"
+  merge_group:
+  pull_request:
+    branches:
+      - "main"
+
+permissions: {}
+
+jobs:
+  zizmor:
+    name: Check GitHub Actions security
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@70fb788f84895a7701f5643d103d587e460b5c99 # v0.6.3
+        with:
+          # Findings upload to code scanning only on push; a pull request from a
+          # fork has no write token for it.
+          advanced-security: ${{ github.event_name == 'push' && 'true' || 'false' }}
+          min-severity: low
