@@ -45,8 +45,8 @@ try:
 except ValueError:
     MAX_CHARS = 20000
 
-# Bound for unresolved task notifications kept in the state file between runs.
 MAX_PENDING_TASK_NOTIFICATIONS = 50
+INTERRUPTED_TURN_MARKER = "[Request interrupted by user]"
 
 
 # ----------------- Paths -----------------
@@ -719,6 +719,40 @@ def truncate_text(s: str, max_chars: int = MAX_CHARS) -> Tuple[str, Dict[str, An
     head = s[:max_chars]
     return head, {"truncated": True, "orig_len": orig_len, "kept_len": len(head), "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest()}
 
+def build_status_message(value: Any, fallback: str) -> str:
+    """Render content as an observation status message."""
+    text = extract_text_from_content(value).strip()
+    if not text and value:
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(value)
+        text = text.strip()
+    return text or fallback
+
+def is_interrupted_turn_row(row: Dict[str, Any]) -> bool:
+    """Report the marker row that ends a turn the user stopped.
+
+    The longer "for tool use" marker denies one tool and does not match, so a
+    turn that continues after a denied tool keeps its default level.
+    """
+    if get_user_or_assistant_role_from_row(row) != "user":
+        return False
+    text = extract_text_from_content(get_content_from_row(row)).lstrip()
+    return text.startswith(INTERRUPTED_TURN_MARKER)
+
+def get_api_error_status(row: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Report the level for a synthetic row that carries an API failure."""
+    if row.get("isApiErrorMessage") is not True:
+        return None
+    return "ERROR", build_status_message(get_content_from_row(row), "Claude API request failed")
+
+def get_status_kwargs(status: Optional[Tuple[str, str]]) -> Dict[str, Any]:
+    if status is None:
+        return {}
+    level, status_message = status
+    return {"level": level, "status_message": status_message}
+
 def get_tool_use_blocks(content: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if isinstance(content, list):
@@ -1140,6 +1174,13 @@ def add_injected_context_row(row: Dict[str, Any], state: TurnAssemblyState) -> b
             state.current_rows.append(row)
     return True
 
+def add_interrupted_turn_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
+    """Keep the interrupt marker in the turn it ended."""
+    if state.current_turn_user_row is None or not is_interrupted_turn_row(row):
+        return False
+    state.current_rows.append(row)
+    return True
+
 def add_tool_result_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
     # tool_result rows show up as role=user with content blocks of type tool_result.
     if not is_tool_result(row):
@@ -1156,6 +1197,8 @@ def add_tool_result_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
                 "content": tool_result_block.get("content"),
                 "timestamp": row_timestamp,
             }
+            if isinstance(tool_result_block.get("is_error"), bool):
+                tool_result_entry["is_error"] = tool_result_block["is_error"]
             if is_async_launch is not None:
                 tool_result_entry["is_async_launch"] = is_async_launch
             if workflow_launch_marker is not None:
@@ -1317,6 +1360,9 @@ def assemble_turns(
             continue
 
         if add_task_notification_row(row, state, task_id_to_tool_use_id, closed_turns=turns):
+            continue
+
+        if add_interrupted_turn_row(row, state):
             continue
 
         role = get_user_or_assistant_role_from_row(row)
@@ -2075,6 +2121,7 @@ class ToolResultForObservation:
     result_timestamp: Optional[datetime] = None
     final_output: Any = None
     final_result_timestamp: Optional[datetime] = None
+    status: Optional[Tuple[str, str]] = None
 
 @dataclass
 class EmittedSingleToolObservation:
@@ -2129,6 +2176,9 @@ def get_tool_result_for_observation(tool_result_entry: Any) -> ToolResultForObse
 
     output, output_meta = render_tool_result_content(tool_result_entry.get("content"))
     result_timestamp = parse_timestamp(tool_result_entry.get("timestamp"))
+    status: Optional[Tuple[str, str]] = None
+    if tool_result_entry.get("is_error") is True:
+        status = "ERROR", build_status_message(tool_result_entry.get("content"), "Tool call failed")
 
     final_output_raw = tool_result_entry.get("final_content")
     if final_output_raw is None:
@@ -2136,6 +2186,7 @@ def get_tool_result_for_observation(tool_result_entry: Any) -> ToolResultForObse
             output=output,
             output_meta=output_meta,
             result_timestamp=result_timestamp,
+            status=status,
         )
 
     final_output, _ = render_tool_result_content(final_output_raw)
@@ -2146,6 +2197,7 @@ def get_tool_result_for_observation(tool_result_entry: Any) -> ToolResultForObse
         result_timestamp=result_timestamp,
         final_output=final_output,
         final_result_timestamp=final_result_timestamp,
+        status=status,
     )
 
 def get_short_transcript_path_for_metadata(path: Any) -> Optional[str]:
@@ -2276,6 +2328,7 @@ def emit_single_tool_observation(
             parent_otel_span=parent_otel_span,
             input=tool_input,
             metadata=tool_metadata,
+            **get_status_kwargs(tool_result.status),
         )
         tool_span.update(output=tool_output)
 
@@ -2513,6 +2566,7 @@ def build_generation_kwargs(
     usage_details = get_usage_details_from_row(assistant_message)
     if usage_details is not None:
         generation_kwargs["usage_details"] = usage_details
+    generation_kwargs.update(get_status_kwargs(get_api_error_status(assistant_message)))
     return generation_kwargs, tool_uses
 
 def emit_generation_observation(
@@ -2811,6 +2865,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
         parent_otel_span=parent_otel_span,
         input={"role": "user", "content": subagent_input_text},
         metadata=subagent_metadata,
+        **get_status_kwargs(get_worst_turn_status(turns)),
     )
 
     latest_end_timestamp = subagent_start_timestamp
@@ -2865,11 +2920,37 @@ def read_subagent_jsonl(path: Path) -> Optional[List[Dict[str, Any]]]:
         rows.append(row)
     return rows
 
+def get_turn_status(turn: Turn) -> Optional[Tuple[str, str]]:
+    """Report the level for the turn as a whole.
+
+    A failure that ends the turn outranks an interrupt. An API failure the turn
+    recovered from stays on its own generation and leaves the turn at default.
+    """
+    if turn.assistant_msgs:
+        terminal_api_error = get_api_error_status(turn.assistant_msgs[-1])
+        if terminal_api_error is not None:
+            return terminal_api_error
+    if any(is_interrupted_turn_row(row) for row in turn.rows):
+        return "WARNING", "Turn interrupted by user"
+    return None
+
+def get_worst_turn_status(turns: List[Turn]) -> Optional[Tuple[str, str]]:
+    """Report the most severe level across turns, ERROR before WARNING."""
+    statuses = [status for status in map(get_turn_status, turns) if status is not None]
+    for level in ("ERROR", "WARNING"):
+        for status in statuses:
+            if status[0] == level:
+                return status
+    return None
+
 def get_turn_end_timestamp(turn: Turn) -> Optional[datetime]:
     last_assistant_timestamp = parse_timestamp(turn.assistant_msgs[-1]) if turn.assistant_msgs else None
+    interrupt_timestamps = [
+        parse_timestamp(row) for row in turn.rows if is_interrupted_turn_row(row)
+    ]
     candidate_end_timestamps = [
         timestamp
-        for timestamp in [last_assistant_timestamp]
+        for timestamp in [last_assistant_timestamp, *interrupt_timestamps]
         if timestamp is not None
     ]
     for tool_result_entry in turn.tool_results_by_id.values():
@@ -2987,6 +3068,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
             as_root=False,
             input=root_input,
             metadata=trace_metadata,
+            **get_status_kwargs(get_turn_status(turn)),
         )
     # Opt-in deterministic trace ids: fail open to the carrier-derived id.
     forced_trace_id: Optional[str] = None
@@ -3005,6 +3087,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         as_root=True,
         input=root_input,
         metadata=trace_metadata,
+        **get_status_kwargs(get_turn_status(turn)),
     )
 
 
