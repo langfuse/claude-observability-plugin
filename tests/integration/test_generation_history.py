@@ -154,7 +154,9 @@ def test_generation_input_within_turn_contains_tool_steps(
     # Second generation of turn 1: user, tool-call assistant, tool results.
     second = inputs[1]
     assert [m.get("role") for m in second] == ["user", "assistant", "tool"]
-    assert second[1]["tool_calls"] == [{"id": "toolu-1", "name": "Read"}]
+    assert second[1]["tool_calls"] == [
+        {"id": "toolu-1", "type": "function", "function": {"name": "Read"}}
+    ]
     assert second[2]["tool_results"][0]["tool_use_id"] == "toolu-1"
     # Turn 2 sees the full tool exchange of turn 1.
     third = inputs[2]
@@ -412,3 +414,66 @@ def test_workflow_agent_generations_carry_history(
         assert isinstance(generation_input, list)
     for generation in generations(fake_langfuse):
         assert "history" in generation.kwargs["metadata"]
+
+
+# ---- tool_calls shape: one producer, every path ----
+
+def test_history_tool_calls_come_from_the_one_shape_builder(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path
+):
+    """Pins the history path to build_generation_output."""
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    write_rows(transcript, tool_turn_rows(SESSION, 1) + simple_turn_rows(SESSION, 2))
+
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config_for(hook_module), SESSION, transcript
+    )
+
+    expected = hook_module.build_generation_output("", [{"id": "toolu-1", "name": "Read"}])
+    live_generation = generation_inputs(fake_langfuse)[1][1]
+    later_turn_history = generation_inputs(fake_langfuse)[2][1]
+
+    assert live_generation["tool_calls"] == expected["tool_calls"]
+    assert later_turn_history["tool_calls"] == expected["tool_calls"]
+
+
+def test_every_tool_call_the_hook_emits_has_the_nested_keys(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path
+):
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    write_rows(transcript, tool_turn_rows(SESSION, 1) + tool_turn_rows(SESSION, 2))
+
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config_for(hook_module), SESSION, transcript
+    )
+
+    seen = 0
+    for messages in generation_inputs(fake_langfuse):
+        for message in messages or []:
+            for tool_call in (message or {}).get("tool_calls", []):
+                assert set(tool_call) == {"id", "type", "function"}
+                assert tool_call["type"] == "function"
+                assert set(tool_call["function"]) == {"name"}
+                seen += 1
+    assert seen > 0, "no tool_calls reached the history, the assertion proved nothing"
+
+
+def test_a_tool_use_without_a_name_keeps_the_nested_shape_in_the_history(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path
+):
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    write_rows(transcript, [
+        user_row(SESSION, 1, "Question 1?"),
+        assistant_row(SESSION, 1, [{"type": "tool_use", "id": "toolu-x"}], part=0),
+        tool_result_row(SESSION, 1, "toolu-x", "result"),
+        assistant_row(SESSION, 1, [{"type": "text", "text": "Answer 1."}], part=1),
+        *simple_turn_rows(SESSION, 2),
+    ])
+
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config_for(hook_module), SESSION, transcript
+    )
+
+    assert generation_inputs(fake_langfuse)[1][1]["tool_calls"] == [
+        {"id": "toolu-x", "type": "function", "function": {"name": None}}
+    ]
