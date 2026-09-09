@@ -39,7 +39,7 @@ def test_thinking_blocks_become_chatml_thinking_parts(hook_module):
                 "content": "The user wants the config path, so I read the settings file.",
             }
         ],
-        "tool_calls": [{"id": "toolu_read", "name": "Read"}],
+        "tool_calls": [{"id": "toolu_read", "type": "function", "function": {"name": "Read"}}],
     }
     assert kwargs["metadata"]["thinking"] == [{"truncated": False, "orig_len": 60}]
 
@@ -117,3 +117,36 @@ def test_thinking_signature_is_not_traced(hook_module):
     parts, _ = hook_module.build_thinking_parts([thinking_block("reasoning", signature="long-attestation-blob")])
 
     assert parts == [{"type": "thinking", "content": "reasoning"}]
+
+
+def test_thinking_sits_beside_parallel_tool_calls(hook_module):
+    kwargs = generation_kwargs(
+        hook_module,
+        [
+            thinking_block("Two files to read, so two calls."),
+            {"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {"file_path": "a.py"}},
+            {"type": "tool_use", "id": "toolu_b", "name": "Read", "input": {"file_path": "b.py"}},
+        ],
+    )
+
+    assert kwargs["output"]["thinking"] == [
+        {"type": "thinking", "content": "Two files to read, so two calls."}
+    ]
+    assert kwargs["output"]["tool_calls"] == [
+        {"id": "toolu_a", "type": "function", "function": {"name": "Read"}},
+        {"id": "toolu_b", "type": "function", "function": {"name": "Read"}},
+    ]
+    # A message of only thinking and tool_use extracts no text.
+    assert "content" not in kwargs["output"]
+
+
+def test_thinking_and_tool_calls_use_the_shared_shape_builder(hook_module):
+    content = [
+        thinking_block("Reading it."),
+        {"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "a.py"}},
+    ]
+
+    kwargs = generation_kwargs(hook_module, content)
+    expected = hook_module.build_generation_output("", [{"id": "toolu_read", "name": "Read"}])
+
+    assert kwargs["output"]["tool_calls"] == expected["tool_calls"]
