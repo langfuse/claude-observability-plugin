@@ -101,6 +101,7 @@ value is a per-run environment variable.
 | `CC_LANGFUSE_DEBUG` | Verbose logging to the hook log (default `false`). | No |
 | `CC_LANGFUSE_MAX_CHARS` | Truncate captured inputs and outputs to this many characters (default `20000`). | No |
 | `CC_LANGFUSE_SKILL_TAGS` | Tag traces with `skill:<name>` for every skill invoked in the turn (default `true`). | No |
+| `CC_LANGFUSE_TRACE_TAGS` | Per-run environment variable. Your own tags added to every trace, next to `claude-code` and the `skill:*` tags. Either a JSON array (`["lane:review","env:prod"]`) or a comma-separated list (`lane:review,env:prod`). Entries over 200 characters, and anything past the first 20, are dropped with a log line. Not applied when a run attaches to an existing trace, because the tags there belong to the calling application. | No |
 | `CC_LANGFUSE_CAPTURE_SKILL_CONTENT` | Include injected skill instruction text in the Skill tool span output (default `false`). | No |
 | `CC_LANGFUSE_CAPTURE_IMAGES` | Upload images to Langfuse and show them in the trace (default `true`). Needs media upload on your deployment (self-hosted: `LANGFUSE_S3_MEDIA_UPLOAD_*`). Set it to `false` if media upload is unavailable: the trace then shows a marker per image, such as `[image image/png ~200KB]`. | No |
 | `CC_LANGFUSE_STATE_DIR` | Absolute directory (`~` is expanded) for the hook's state, lock and log files (default `~/.claude/state`). Set one per `CLAUDE_CONFIG_DIR` installation to keep them apart. An unusable value falls back to the default and logs a warning. | No |
