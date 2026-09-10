@@ -451,7 +451,14 @@ def is_session_end_hook_payload(payload: Dict[str, Any]) -> bool:
 
 # ----------------- State file concurrency control -----------------
 class FileLock:
-    def __init__(self, path: Path, timeout_s: float = 2.0):
+    # The lock is held for the whole of emit_new_turns_from_transcript, which
+    # includes emitting to Langfuse over the network, so hold time scales with
+    # how much a session has to flush (an 82-turn flush was measured at 2.16s).
+    # The timeout therefore has to exceed a full flush, not just a state-file
+    # write. Waiting is strictly better than the alternative here: the hook is
+    # async and the work is idempotent, so a slow acquire costs latency while a
+    # failed acquire costs data.
+    def __init__(self, path: Path, timeout_s: float = 30.0):
         self.path = path
         self.timeout_s = timeout_s
         self._fh = None
@@ -3519,7 +3526,11 @@ def main() -> int:
         return 0
 
     except TimeoutError as e:
-        debug(f"lock timeout, skipping: {e}")
+        # Skipping means this turn is not exported until the session's next
+        # Stop, and never at all if the session goes idle first. Log at info so
+        # it is visible without CC_LANGFUSE_DEBUG, since the symptom shows up in
+        # Langfuse as missing data with no client-side trace of the cause.
+        info(f"lock timeout, skipping: {e}")
         return 0
 
     except Exception as e:
