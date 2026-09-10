@@ -13,14 +13,12 @@
       "type": "string",
       "title": "Langfuse Secret Key",
       "description": "Your Langfuse project secret key (sk-lf-...)",
-      "sensitive": true,
-      "required": true
+      "sensitive": true
     },
     "LANGFUSE_PUBLIC_KEY": {
       "type": "string",
       "title": "Langfuse Public Key",
-      "description": "Your Langfuse project public key (pk-lf-...)",
-      "required": true
+      "description": "Your Langfuse project public key (pk-lf-...)"
     },
     "LANGFUSE_BASE_URL": {
       "type": "string",
