@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -1950,13 +1951,20 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
     )
 
 # ---- Trace naming and tags ----
+# Matches the SKILL.md read path of a skill directory, e.g.
+# ~/.claude/skills/<name>/SKILL.md or any .../skills/<name>/SKILL.md.
+SKILL_MD_PATH_RE = re.compile(r"(?:^|/)skills/([A-Za-z0-9_.-]+)/SKILL\.md$")
+
+
 def add_skill_tags_from_rows(rows: List[Dict[str, Any]], names: List[str], prefix: str) -> None:
     """Collect '<prefix><name>' tags for every skill trail in the rows.
 
-    Skills leave two different transcript trails: a tool_use block named
-    "Skill" when Claude invokes the skill itself, and a top-level
+    Skills leave three different transcript trails: a tool_use block named
+    "Skill" when Claude invokes the skill itself, a top-level
     attributionSkill field on assistant rows when the user invokes it as a
-    slash command (which never produces a Skill tool_use block).
+    slash command (which never produces a Skill tool_use block), and a Read
+    tool_use whose file_path is a skill's SKILL.md (how dependency
+    sub-skills referenced from another skill's body get loaded).
     """
     def add_skill(skill: Any) -> None:
         if isinstance(skill, str) and skill and f"{prefix}{skill}" not in names:
@@ -1967,10 +1975,18 @@ def add_skill_tags_from_rows(rows: List[Dict[str, Any]], names: List[str], prefi
             continue
         add_skill(row.get("attributionSkill"))
         for tool_use in get_tool_use_blocks(get_content_from_row(row)):
-            if tool_use.get("name") != "Skill":
-                continue
             tool_input = tool_use.get("input")
-            add_skill(tool_input.get("skill") if isinstance(tool_input, dict) else None)
+            if not isinstance(tool_input, dict):
+                continue
+            tool_name = tool_use.get("name")
+            if tool_name == "Skill":
+                add_skill(tool_input.get("skill"))
+            elif tool_name == "Read":
+                file_path = tool_input.get("file_path")
+                if isinstance(file_path, str):
+                    match = SKILL_MD_PATH_RE.search(file_path)
+                    if match:
+                        add_skill(match.group(1))
 
 
 def collect_skill_tags(turn: Turn) -> List[str]:
