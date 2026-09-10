@@ -450,6 +450,10 @@ def is_session_end_hook_payload(payload: Dict[str, Any]) -> bool:
 
 
 # ----------------- State file concurrency control -----------------
+def get_session_lock_path(key: str) -> Path:
+    return STATE_DIR / f"langfuse_state.{key[:16]}.lock"
+
+
 class FileLock:
     def __init__(self, path: Path, timeout_s: float = 2.0):
         self.path = path
@@ -575,6 +579,23 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
+def sweep_stale_session_locks(state: Dict[str, Any], cutoff: datetime) -> None:
+    live = {k[:16] for k in state if isinstance(k, str)}
+    try:
+        locks = list(STATE_DIR.glob("langfuse_state.*.lock"))
+    except OSError:
+        return
+    for lock in locks:
+        stem = lock.name[len("langfuse_state."):-len(".lock")]
+        if len(stem) != 16 or stem in live:
+            continue
+        try:
+            if lock.stat().st_mtime < cutoff.timestamp():
+                lock.unlink()
+        except OSError:
+            pass
+
+
 def save_hook_state(state: Dict[str, Any]) -> None:
     try:
         # Drop session entries older than 30 days to keep the file bounded.
@@ -592,6 +613,7 @@ def save_hook_state(state: Dict[str, Any]) -> None:
                 continue
             if ts < cutoff:
                 del state[k]
+        sweep_stale_session_locks(state, cutoff)
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
@@ -3382,9 +3404,11 @@ def emit_new_turns_from_transcript(
     *,
     flush_deferred_agent_turns: bool = False,
 ) -> int:
-    with FileLock(LOCK_FILE):
-        state = load_hook_state()
-        key = get_session_state_key(session_id, str(transcript_path))
+    key = get_session_state_key(session_id, str(transcript_path))
+
+    with FileLock(get_session_lock_path(key)):
+        with FileLock(LOCK_FILE):
+            state = load_hook_state()
         session_state = get_session_state(state, key)
 
         subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
@@ -3453,7 +3477,9 @@ def emit_new_turns_from_transcript(
         # duplicate window): progress is persisted before the SDK flush in
         # main(); a dropped flush leaves emitted_keys pointing at spans that
         # never reached the server.
-        save_session_state(state, key, session_state)
+        with FileLock(LOCK_FILE):
+            state = load_hook_state()
+            save_session_state(state, key, session_state)
 
     return emitted
 
@@ -3519,7 +3545,7 @@ def main() -> int:
         return 0
 
     except TimeoutError as e:
-        debug(f"lock timeout, skipping: {e}")
+        info(f"lock timeout, skipping: {e}")
         return 0
 
     except Exception as e:
