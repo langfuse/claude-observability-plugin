@@ -63,6 +63,12 @@
       "description": "Upload images to Langfuse and show them in the trace. This includes pasted images and screenshots from tool results. Your Langfuse deployment must support media upload. Set to false to show short text markers instead.",
       "default": true
     },
+    "CC_LANGFUSE_REDACT_SECRETS": {
+      "type": "boolean",
+      "title": "Redact secrets from span content",
+      "description": "Scan every string span attribute at export and replace anything that looks like a private key, a labeled credential (api_key/token/password/... assignment), or an unlabeled high-entropy secret with a [REDACTED:...] marker before it leaves this machine. If the installed langfuse SDK is too old to support this, tracing is disabled entirely rather than sending unmasked content.",
+      "default": true
+    },
     "CC_LANGFUSE_STATE_DIR": {
       "type": "string",
       "title": "State directory",

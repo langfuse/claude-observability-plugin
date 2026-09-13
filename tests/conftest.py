@@ -72,6 +72,71 @@ def _install_langfuse_stubs() -> None:
     langfuse_module.media = media_module
     sys.modules["langfuse.media"] = media_module
 
+    types_module = types.ModuleType("langfuse.types")
+
+    class OtelSpanIdentifier:
+        def __init__(self, trace_id: str, span_id: str) -> None:
+            self.trace_id = trace_id
+            self.span_id = span_id
+
+        def __hash__(self) -> int:
+            return hash((self.trace_id, self.span_id))
+
+        def __eq__(self, other: object) -> bool:
+            return (
+                isinstance(other, OtelSpanIdentifier)
+                and self.trace_id == other.trace_id
+                and self.span_id == other.span_id
+            )
+
+    class OtelSpanData:
+        def __init__(
+            self,
+            *,
+            trace_id: str,
+            span_id: str,
+            parent_span_id: str | None,
+            name: str,
+            instrumentation_scope_name: str | None,
+            instrumentation_scope_version: str | None,
+            attributes: dict[str, Any],
+            resource_attributes: dict[str, Any],
+        ) -> None:
+            self.trace_id = trace_id
+            self.span_id = span_id
+            self.parent_span_id = parent_span_id
+            self.name = name
+            self.instrumentation_scope_name = instrumentation_scope_name
+            self.instrumentation_scope_version = instrumentation_scope_version
+            self.attributes = attributes
+            self.resource_attributes = resource_attributes
+
+    class OtelSpanPatch:
+        def __init__(
+            self,
+            *,
+            set_attributes: dict[str, Any] | None = None,
+            delete_attributes: tuple[str, ...] = (),
+        ) -> None:
+            self.set_attributes = dict(set_attributes or {})
+            self.delete_attributes = tuple(delete_attributes)
+
+    class MaskOtelSpansParams:
+        def __init__(self, *, spans: dict[Any, OtelSpanData]) -> None:
+            self.spans = spans
+
+    class MaskOtelSpansResult:
+        def __init__(self, *, span_patches: dict[Any, OtelSpanPatch | None] | None = None) -> None:
+            self.span_patches = dict(span_patches or {})
+
+    types_module.OtelSpanIdentifier = OtelSpanIdentifier
+    types_module.OtelSpanData = OtelSpanData
+    types_module.OtelSpanPatch = OtelSpanPatch
+    types_module.MaskOtelSpansParams = MaskOtelSpansParams
+    types_module.MaskOtelSpansResult = MaskOtelSpansResult
+    langfuse_module.types = types_module
+    sys.modules["langfuse.types"] = types_module
+
     opentelemetry_module = types.ModuleType("opentelemetry")
     trace_module = types.ModuleType("opentelemetry.trace")
 

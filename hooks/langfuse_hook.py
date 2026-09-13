@@ -2,7 +2,9 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "langfuse>=4.7,<5",
+#   # >=4.14.3 for langfuse-python#1803 (a duplicate span id used to silently
+#   # drop the whole export batch); mask_otel_spans itself needs only >=4.9.
+#   "langfuse>=4.14.3,<5",
 # ]
 # ///
 """
@@ -12,14 +14,17 @@ Claude Code -> Langfuse hook
 
 import base64
 import contextlib
+import hashlib
 import json
 import logging
+import math
 import os
 import random
+import re
 import sys
 import threading
 import time
-import hashlib
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -40,6 +45,7 @@ DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+REDACT_SECRETS = (_opt("CC_LANGFUSE_REDACT_SECRETS") or "true").lower() == "true"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
@@ -366,16 +372,160 @@ try:
 except Exception:
     LangfuseMedia = None
 
+# mask_otel_spans and its types are only in langfuse>=4.9 (langfuse-python#1646).
+# If REDACT_SECRETS is on and this SDK can't redact, refuse to create a client
+# rather than send unmasked content — see the fail-closed check below.
+try:
+    from langfuse.types import MaskOtelSpansParams, MaskOtelSpansResult, OtelSpanPatch
+    _MASK_TYPES_AVAILABLE = True
+except Exception:
+    MaskOtelSpansParams = MaskOtelSpansResult = OtelSpanPatch = None
+    _MASK_TYPES_AVAILABLE = False
+
+
+# ----------------- Redaction (mask_otel_spans) -----------------
+# Structural attributes the SDK itself sets: never contain user/tool content,
+# always safe to leave unmasked. Everything else is scanned.
+_MASK_SKIP_KEYS = frozenset(
+    {
+        "langfuse.observation.type",
+        "langfuse.observation.level",
+        "langfuse.observation.model.name",
+        "langfuse.observation.model.parameters",
+        "langfuse.observation.usage_details",
+        "langfuse.observation.cost_details",
+        "langfuse.environment",
+        "langfuse.release",
+        "langfuse.version",
+    }
+)
+_MASK_SKIP_PREFIXES = ("langfuse.internal.",)
+
+# A PEM block, greedy across lines to the END marker, or to end-of-string if the
+# value was truncated (e.g. by an earlier MAX_CHARS cut) before an END line.
+_PEM_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+    re.DOTALL,
+)
+
+# key/secret/token/password/.../auth must END the identifier, so max_tokens and
+# input_tokens (which end in the plural "tokens") don't match "token". The value
+# itself is either quoted (any content up to the matching quote — passwords can
+# hold punctuation a bare token can't) or bare (a conservative token charset, so
+# an unquoted match doesn't run on into surrounding prose or JSON syntax).
+_CRED_KEYWORDS = ("key", "secret", "token", "password", "passwd", "pwd", "credential", "auth")
+_CRED_RE = re.compile(
+    r"(?i)(\b[a-z0-9_]*(?:" + "|".join(_CRED_KEYWORDS) + r")\b[\"']?\s*[:=]\s*)"
+    r"(?:([\"'])((?:(?!\2).)+)\2|([a-z0-9_\-./+=]{8,}))"
+)
+
+
+def _cred_replace(m: "re.Match[str]") -> str:
+    prefix, quote = m.group(1), m.group(2)
+    if quote:
+        return f"{prefix}{quote}[REDACTED:credential]{quote}"
+    return f"{prefix}[REDACTED:credential]"
+
+# Fallback for unlabeled secrets: a long, mixed-character-class token. Unlabeled
+# AWS-style secrets split on "/" and lose enough entropy per fragment to dodge
+# this, so they rely on _CRED_RE instead when they're assigned to a named var.
+_ENTROPY_TOKEN_RE = re.compile(r"[A-Za-z0-9_+/=-]{24,}")
+_ENTROPY_THRESHOLD_BITS = 4.0
+_ENTROPY_MIN_CHAR_CLASSES = 3
+
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    length = len(s)
+    counts = Counter(s)
+    return -sum((n / length) * math.log2(n / length) for n in counts.values())
+
+
+def _char_class_count(s: str) -> int:
+    classes = 0
+    if any(c.islower() for c in s):
+        classes += 1
+    if any(c.isupper() for c in s):
+        classes += 1
+    if any(c.isdigit() for c in s):
+        classes += 1
+    if any(not c.isalnum() for c in s):
+        classes += 1
+    return classes
+
+
+def _redact_high_entropy_tokens(text: str) -> str:
+    def _replace(m: "re.Match[str]") -> str:
+        token = m.group(0)
+        if (
+            _char_class_count(token) >= _ENTROPY_MIN_CHAR_CLASSES
+            and _shannon_entropy(token) >= _ENTROPY_THRESHOLD_BITS
+        ):
+            return "[REDACTED:entropy]"
+        return token
+
+    return _ENTROPY_TOKEN_RE.sub(_replace, text)
+
+
+def _redact_string(text: str) -> str:
+    text = _PEM_RE.sub("[REDACTED:pem]", text)
+    text = _CRED_RE.sub(_cred_replace, text)
+    text = _redact_high_entropy_tokens(text)
+    return text
+
+
+def _redact_attribute_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_string(value)
+    if isinstance(value, (list, tuple)) and value and all(isinstance(v, str) for v in value):
+        return type(value)(_redact_string(v) for v in value)
+    # bool/int/float and homogeneous numeric/bool sequences: nothing to redact.
+    return value
+
+
+def mask_otel_spans(*, params: "MaskOtelSpansParams") -> "MaskOtelSpansResult":
+    """Redact secrets from every string span attribute before export.
+
+    Each attribute is masked independently: one bad value becomes
+    "[REDACTED:masker-error]" rather than raising, which under the SDK's
+    contract would drop the whole export batch instead of just that value.
+    """
+    patches: Dict[Any, "OtelSpanPatch"] = {}
+    for identifier, span in params.spans.items():
+        set_attrs: Dict[str, Any] = {}
+        for key, value in span.attributes.items():
+            if key in _MASK_SKIP_KEYS or key.startswith(_MASK_SKIP_PREFIXES):
+                continue
+            try:
+                new_value = _redact_attribute_value(value)
+            except Exception:
+                new_value = "[REDACTED:masker-error]"
+            if new_value != value:
+                set_attrs[key] = new_value
+        if set_attrs:
+            patches[identifier] = OtelSpanPatch(set_attributes=set_attrs)
+    return MaskOtelSpansResult(span_patches=patches)
+
+
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
     # With capture off, stop the SDK from uploading base64 images it finds
     # in span payloads on its own. The SDK reads an empty value as enabled.
     if not CAPTURE_IMAGES and not os.environ.get("LANGFUSE_MEDIA_UPLOAD_ENABLED"):
         os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
+    if REDACT_SECRETS and not _MASK_TYPES_AVAILABLE:
+        info(
+            "CC_LANGFUSE_REDACT_SECRETS is on but this langfuse SDK version has no "
+            "mask_otel_spans support; refusing to create a client rather than send "
+            "unmasked content (fail closed)"
+        )
+        return None
     try:
         return Langfuse(
             public_key=config.public_key,
             secret_key=config.secret_key,
             host=config.host,
+            mask_otel_spans=mask_otel_spans if REDACT_SECRETS else None,
         )
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
