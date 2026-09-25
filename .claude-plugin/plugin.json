@@ -70,6 +70,11 @@
       "type": "string",
       "title": "Trace ID seed",
       "description": "Optional. Derive deterministic trace ids as Langfuse.create_trace_id(seed=f\"{seed}:{turn_number}\") so external systems can precompute them. Use a unique seed per session (e.g. the --session-id UUID). Leave empty for auto-generated ids."
+    },
+    "CC_LANGFUSE_HEADERS_COMMAND": {
+      "type": "string",
+      "title": "Extra request headers command",
+      "description": "Optional. Shell command whose stdout is a JSON object of header name to value, sent with every Langfuse request. For Langfuse deployments behind an auth proxy that needs a short-lived token; the command runs on every hook run, so the token stays fresh. Leave empty to send no extra headers."
     }
   }
 }
