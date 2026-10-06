@@ -34,7 +34,7 @@ def test_emit_turn_observations_creates_generation_tool_and_subagent_observation
     assert "Async agent launched successfully." in agent_tool.output
 
 
-def test_nested_subagents_document_current_non_recursive_emission_behavior(
+def test_nested_subagents_emit_inner_agent_under_outer_agent(
     hook_module,
     fixture_transcript_path,
     read_fixture_jsonl,
@@ -54,10 +54,20 @@ def test_nested_subagents_document_current_non_recursive_emission_behavior(
         subagent_transcripts_by_tool_use_id=subagents,
     )
 
-    names = [observation.name for observation in fake_langfuse.observations]
-    assert "Subagent: Outer agent" in names
-    assert "Tool: Agent" in names
-    assert "Subagent: Inner agent" not in names
+    by_name = {observation.name: observation for observation in fake_langfuse.observations}
+    outer = by_name["Subagent: Outer agent"]
+    inner = by_name["Subagent: Inner agent"]
+
+    ancestors = []
+    span = inner._otel_span.parent
+    while span is not None:
+        ancestors.append(span)
+        span = span.parent
+    assert outer._otel_span in ancestors
+    assert any(
+        observation._otel_span.parent is inner._otel_span and observation.as_type == "generation"
+        for observation in fake_langfuse.observations
+    )
 
 
 # The fixture's human wait: the AskUserQuestion tool_use is written at

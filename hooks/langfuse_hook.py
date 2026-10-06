@@ -2434,6 +2434,7 @@ def emit_single_tool_observation(
                     parent_otel_span,
                     subagent,
                     tool_use_timestamp,
+                    subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
                 )
 
     workflow_end_timestamp = None
@@ -2708,6 +2709,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             parent_otel_span,
             pending_subagent["subagent"],
             pending_subagent.get("display_start_timestamp") or pending_subagent.get("start_timestamp"),
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
         )
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
 
@@ -2896,7 +2898,9 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
                                span_name: Optional[str] = None,
                                extra_metadata: Optional[Dict[str, Any]] = None,
                                generation_name: str = "Subagent LLM Call",
-                               empty_output_fallback: Optional[str] = None) -> Optional[datetime]:
+                               empty_output_fallback: Optional[str] = None,
+                               subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+                               ) -> Optional[datetime]:
     path = subagent.get("path")
     if not isinstance(path, Path):
         return start_timestamp
@@ -2955,7 +2959,8 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             turn,
             previous_start_timestamp,
             generation_name=generation_name,
-            subagent_transcripts_by_tool_use_id=None,
+            # Agents launched by this agent are listed in the same map.
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
             history_prefix=list(subagent_history),
         )
         subagent_history.extend(build_turn_history_messages(turn))
