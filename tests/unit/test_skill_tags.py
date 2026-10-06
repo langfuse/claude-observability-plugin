@@ -172,3 +172,55 @@ def test_same_skill_across_two_subagents_is_tagged_once(hook_module, tmp_path):
     assert hook_module.collect_subagent_skill_tags(turns[0], sub_map) == [
         "subagent-skill:deep-research",
     ]
+
+
+def make_read_tool_use_row(file_path: str, uuid: str = "assistant-read") -> dict[str, Any]:
+    """Invocation path 3: a dependency sub-skill loaded by reading its
+    SKILL.md directly (referenced from another skill's body)."""
+    return {
+        "type": "assistant",
+        "timestamp": "2026-01-01T00:00:03.000Z",
+        "uuid": uuid,
+        "message": {
+            "id": f"msg-{uuid}",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": f"toolu_{uuid}",
+                    "name": "Read",
+                    "input": {"file_path": file_path},
+                }
+            ],
+        },
+    }
+
+
+def test_skill_loaded_via_read_of_skill_md_is_tagged(hook_module):
+    rows = [
+        make_user_row("commit this"),
+        make_read_tool_use_row("/Users/u/.claude/skills/shell-quoting-pitfalls/SKILL.md"),
+    ]
+
+    assert collect_tags(hook_module, rows) == ["skill:shell-quoting-pitfalls"]
+
+
+def test_read_of_non_skill_file_is_not_tagged(hook_module):
+    rows = [
+        make_user_row("read these"),
+        make_read_tool_use_row("/Users/u/project/src/main.py", uuid="assistant-read-1"),
+        make_read_tool_use_row("/Users/u/.claude/skills/foo/references/cli.md", uuid="assistant-read-2"),
+    ]
+
+    assert collect_tags(hook_module, rows) == []
+
+
+def test_read_and_invoke_of_same_skill_dedupes(hook_module):
+    rows = [
+        make_user_row("use the skill"),
+        make_skill_tool_use_row("langfuse"),
+        make_read_tool_use_row("/Users/u/.claude/skills/langfuse/SKILL.md"),
+    ]
+
+    assert collect_tags(hook_module, rows) == ["skill:langfuse"]
