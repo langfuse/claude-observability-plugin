@@ -537,6 +537,10 @@ class SessionState:
     # partially emitted turn across firings and across the open -> closed ->
     # deferred transitions; entries are dropped once the turn is finalized.
     turn_progress: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Session titles seen in the transcript, keyed by the row type that
+    # carried them ("custom-title", "ai-title"). Only new rows are read per
+    # firing, so the titles are kept here to stay available to later ones.
+    titles_by_type: Dict[str, str] = field(default_factory=dict)
 
 def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
@@ -555,6 +559,9 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     turn_progress = s.get("turn_progress")
     if not isinstance(turn_progress, dict):
         turn_progress = {}
+    titles_by_type = s.get("titles_by_type")
+    if not isinstance(titles_by_type, dict):
+        titles_by_type = {}
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
@@ -564,6 +571,7 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
         open_turn=open_turn,
         turn_numbers=turn_numbers,
         turn_progress=turn_progress,
+        titles_by_type=titles_by_type,
     )
 
 def update_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
@@ -576,6 +584,7 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "open_turn": session_state.open_turn or {},
         "turn_numbers": session_state.turn_numbers or {},
         "turn_progress": session_state.turn_progress or {},
+        "titles_by_type": session_state.titles_by_type or {},
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -913,6 +922,52 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
             continue
 
     return msgs, session_state
+
+
+# ----------------- Session title -----------------
+# Claude Code writes the session title into the transcript as its own row:
+# "custom-title" (set by /rename) or "ai-title" (auto-generated). A row is
+# appended again whenever the title changes, so the last occurrence of a type
+# is that type's current title. Listed in preference order.
+SESSION_TITLE_ROW_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("custom-title", "customTitle"),
+    ("ai-title", "aiTitle"),
+)
+MAX_SESSION_TITLE_CHARS = 200
+
+
+def clean_session_title(value: Any) -> Optional[str]:
+    """Trimmed, length-bounded title, or None for anything unusable."""
+    if not isinstance(value, str):
+        return None
+    title = value.strip()
+    if not title:
+        return None
+    return title[:MAX_SESSION_TITLE_CHARS]
+
+
+def update_session_titles(session_state: SessionState, rows: List[Dict[str, Any]]) -> None:
+    """Record the session titles carried by these rows."""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for row_type, title_field in SESSION_TITLE_ROW_FIELDS:
+            if row.get("type") != row_type:
+                continue
+            title = clean_session_title(row.get(title_field))
+            if title is not None:
+                session_state.titles_by_type[row_type] = title
+                debug(f"Session title from {row_type} row")
+
+
+def get_session_title(session_state: SessionState) -> Optional[str]:
+    """The session's title: the operator's own rename wins over the
+    auto-generated one, whichever row came last in the transcript."""
+    for row_type, _ in SESSION_TITLE_ROW_FIELDS:
+        title = clean_session_title(session_state.titles_by_type.get(row_type))
+        if title is not None:
+            return title
+    return None
 
 
 # ----------------- Turn assembly -----------------
@@ -1574,6 +1629,8 @@ def get_new_turns_from_transcript(
                 f"{session_id}; not checking for copied history"
             )
 
+    update_session_titles(session_state, rows)
+
     # Re-attach the trailing open turn from the previous run. Stop fires
     # multiple times within one logical turn, so a batch can begin with
     # user-less continuation rows (task notifications, assistant rows); with
@@ -2029,7 +2086,8 @@ def collect_subagent_skill_tags(
                 add_skill_tags_from_rows(rows, names, "subagent-skill:")
     return names
 
-# Constant on purpose: a shared trace name keeps Langfuse name-based grouping usable.
+# Trace name for sessions without a title; a shared name keeps Langfuse
+# name-based grouping usable for them.
 TRACE_NAME = "Claude Code Turn"
 
 def get_trace_tags(
@@ -3198,7 +3256,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
               trace_seed: Optional[str] = None,
               parent_context: Optional[Tuple[str, str]] = None,
               workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
-              history_prefix: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+              history_prefix: Optional[List[Dict[str, Any]]] = None,
+              session_title: Optional[str] = None) -> Dict[str, Any]:
     """Emit a turn, resuming from prior firings' progress.
 
     With no progress and close=True this is the classic one-shot emission.
@@ -3220,7 +3279,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         attribute_propagation = propagate_attributes(
             session_id=session_id,
             user_id=user_id,
-            trace_name=TRACE_NAME,
+            trace_name=session_title or TRACE_NAME,
             tags=get_trace_tags(turn, subagent_transcripts_by_tool_use_id),
         )
     else:
@@ -3328,6 +3387,7 @@ def emit_and_close_ready_turns(
                     if session_history is not None
                     else None
                 ),
+                session_title=get_session_title(session_state),
             )
         except Exception as e:
             # Log at INFO so SDK incompatibilities (and other emit failures)
@@ -3398,6 +3458,7 @@ def emit_ready_observations_of_open_turn(
                 if session_history is not None
                 else None
             ),
+            session_title=get_session_title(session_state),
         )
         session_state.turn_progress[user_row_uuid] = progress
     except Exception as e:
