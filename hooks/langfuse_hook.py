@@ -639,6 +639,9 @@ def get_user_or_assistant_role_from_row(row: Dict[str, Any]) -> Optional[str]:
     # Claude Code transcript row format is internal. Prefer top-level row.type
     # when it marks a chat row, then fall back to nested message.role.
     row_type = row.get("type")
+    # Request snapshots are internal records, not conversation messages.
+    if row_type == "api-request-blob":
+        return None
     if row_type in ("user", "assistant"):
         return row_type
 
