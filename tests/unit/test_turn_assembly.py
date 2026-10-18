@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.mark.parametrize("role", ["user", "assistant"])
+def test_api_request_snapshots_are_not_conversation_rows(hook_module, role):
+    row = {"type": "api-request-blob", "message": {"role": role}}
+    assert hook_module.get_user_or_assistant_role_from_row(row) is None
+
 
 def test_build_turns_merges_split_assistant_rows(
     hook_module,
