@@ -91,3 +91,39 @@ def test_meta_rows_do_not_start_or_flush_turns(hook_module):
     assert len(turns) == 1
     assert turns[0].injected_by_tool_id == {"toolu_skill": "Injected skill instructions"}
     assert turns[0].tool_results_by_id["toolu_skill"]["content"] == "Skill result"
+
+
+def test_typed_non_chat_rows_with_a_chat_role_are_ignored(hook_module):
+    # Claude Code also writes rows such as `api-request-blob` whose nested
+    # message carries a chat role but no timestamp. They are request records,
+    # not conversation rows: one must not stand in for the user prompt (the
+    # turn would start at hook time) or add an extra generation.
+    rows = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {"role": "user", "content": "Say hello."},
+        },
+        {"type": "api-request-blob", "message": {"role": "user", "content": "Say hello."}},
+        {
+            "type": "assistant",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "message": {"id": "msg-1", "role": "assistant", "content": [{"type": "text", "text": "Hello."}]},
+        },
+        {"type": "api-request-blob", "message": {"role": "assistant", "content": "Hello."}},
+    ]
+
+    turns = hook_module.build_turns(rows)
+
+    assert len(turns) == 1
+    assert turns[0].user_msg["uuid"] == "u1"
+    assert hook_module.parse_timestamp(turns[0].user_msg) is not None
+    assert len(turns[0].assistant_msgs) == 1
+    assert hook_module.get_message_id(turns[0].assistant_msgs[0]) == "msg-1"
+
+
+def test_untyped_rows_fall_back_to_the_message_role(hook_module):
+    assert hook_module.get_user_or_assistant_role_from_row({"message": {"role": "user"}}) == "user"
+    assert hook_module.get_user_or_assistant_role_from_row({"message": {"role": "assistant"}}) == "assistant"
+    assert hook_module.get_user_or_assistant_role_from_row({"type": "api-request-blob", "message": {"role": "user"}}) is None
