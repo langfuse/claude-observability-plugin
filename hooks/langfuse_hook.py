@@ -2153,18 +2153,64 @@ def build_turn_history_messages(turn: Turn) -> List[Dict[str, Any]]:
 
 @dataclass
 class SessionHistory:
-    """Flat ChatML view of the whole transcript, with one index per turn."""
+    """Flat ChatML view of the whole transcript, with one index per turn.
+
+    A turn's prefix starts at its context segment: after a /compact (manual or
+    automatic) the model no longer sees the earlier messages, only the compact
+    summary and what the compaction preserved.
+    """
     messages: List[Dict[str, Any]] = field(default_factory=list)
     start_index_by_user_row_uuid: Dict[str, int] = field(default_factory=dict)
+    segment_start_index_by_user_row_uuid: Dict[str, int] = field(default_factory=dict)
 
     def prefix_for_turn(self, user_row_uuid: Any) -> Optional[List[Dict[str, Any]]]:
-        """All messages before the given turn, or None when the turn is unknown."""
+        """Messages of the turn's context segment before it, or None when the turn is unknown."""
         if not isinstance(user_row_uuid, str) or not user_row_uuid:
             return None
         start_index = self.start_index_by_user_row_uuid.get(user_row_uuid)
         if start_index is None:
             return None
-        return self.messages[:start_index]
+        segment_start_index = self.segment_start_index_by_user_row_uuid.get(user_row_uuid, 0)
+        return self.messages[segment_start_index:start_index]
+
+
+def is_compact_boundary_row(row: Dict[str, Any]) -> bool:
+    return row.get("type") == "system" and row.get("subtype") == "compact_boundary"
+
+
+def get_compact_preserved_rows(boundary_row: Dict[str, Any], rows: List[Dict[str, Any]],
+                               index_by_uuid: Dict[str, int]) -> List[Dict[str, Any]]:
+    """Chat rows a compaction kept verbatim (compactMetadata.preservedSegment head..tail)."""
+    metadata = boundary_row.get("compactMetadata")
+    segment = metadata.get("preservedSegment") if isinstance(metadata, dict) else None
+    if not isinstance(segment, dict):
+        return []
+    head_index = index_by_uuid.get(segment.get("headUuid"))
+    tail_index = index_by_uuid.get(segment.get("tailUuid"))
+    if head_index is None or tail_index is None or tail_index < head_index:
+        return []
+    return [
+        row for row in rows[head_index:tail_index + 1]
+        if row.get("type") in ("user", "assistant") and not row.get("isMeta")
+    ]
+
+
+def build_loose_row_history_messages(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """ChatML for rows outside any assembled turn (a compaction's preserved segment)."""
+    messages: List[Dict[str, Any]] = []
+    for row in rows:
+        content = get_content_from_row(row)
+        if get_user_or_assistant_role_from_row(row) == "assistant":
+            assistant_text, _ = truncate_text(extract_text_from_content(content))
+            messages.append(build_generation_output(assistant_text, get_tool_use_blocks(content)))
+        elif is_tool_result(row):
+            messages.append({"role": "tool", "tool_results": [
+                {"tool_use_id": block.get("tool_use_id"), "output": truncate_text(get_tool_result_text(block))[0]}
+                for block in get_tool_result_blocks(content)
+            ]})
+        else:
+            messages.append({"role": "user", "content": build_user_history_content(row)})
+    return messages
 
 
 def build_session_history(
@@ -2174,17 +2220,47 @@ def build_session_history(
     """Rebuild the conversation of the whole transcript file as ChatML.
 
     Reads from byte 0 on purpose: the emission offset only tracks what was
-    exported, while a generation input needs every earlier message.
+    exported, while a generation input needs every earlier message of its
+    context window. Each compact boundary starts a new window.
     """
     rows = read_subagent_jsonl(transcript_path)
     if not rows:
         return None
+    index_by_uuid = {row.get("uuid"): i for i, row in enumerate(rows) if isinstance(row.get("uuid"), str)}
+    # Split at each compact boundary: a segment is one context window.
+    segments: List[List[Dict[str, Any]]] = [[]]
+    preserved_rows_by_segment: List[List[Dict[str, Any]]] = [[]]
+    for row in rows:
+        if is_compact_boundary_row(row):
+            segments.append([])
+            preserved_rows_by_segment.append(get_compact_preserved_rows(row, rows, index_by_uuid))
+        else:
+            segments[-1].append(row)
+
     history = SessionHistory()
-    for turn in build_turns(rows, task_id_to_tool_use_id):
-        user_row_uuid = turn.user_msg.get("uuid")
-        if isinstance(user_row_uuid, str) and user_row_uuid:
-            history.start_index_by_user_row_uuid.setdefault(user_row_uuid, len(history.messages))
-        history.messages.extend(build_turn_history_messages(turn))
+    for segment_rows, preserved_rows in zip(segments, preserved_rows_by_segment):
+        segment_start_index = len(history.messages)
+        turns = build_turns(segment_rows, task_id_to_tool_use_id)
+        summary_row = next((row for row in segment_rows if row.get("isCompactSummary")), None)
+        # The window after a compaction reads: summary, preserved messages, then
+        # the turns that follow. When work resumed right after an automatic
+        # compaction, the summary row itself opens the first turn.
+        preserved_messages = build_loose_row_history_messages(preserved_rows)
+        if summary_row is not None and not any(turn.user_msg is summary_row for turn in turns):
+            history.messages.append({"role": "user", "content": build_user_history_content(summary_row)})
+            history.messages.extend(preserved_messages)
+            preserved_messages = []
+        for turn in turns:
+            user_row_uuid = turn.user_msg.get("uuid")
+            if isinstance(user_row_uuid, str) and user_row_uuid:
+                history.start_index_by_user_row_uuid.setdefault(user_row_uuid, len(history.messages))
+                history.segment_start_index_by_user_row_uuid.setdefault(user_row_uuid, segment_start_index)
+            turn_messages = build_turn_history_messages(turn)
+            if turn.user_msg is summary_row and preserved_messages:
+                turn_messages = turn_messages[:1] + preserved_messages + turn_messages[1:]
+                preserved_messages = []
+            history.messages.extend(turn_messages)
+        history.messages.extend(preserved_messages)
     return history
 
 
