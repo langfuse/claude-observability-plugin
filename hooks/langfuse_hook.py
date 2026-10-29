@@ -633,6 +633,17 @@ def get_content_from_row(row: Dict[str, Any]) -> Any:
     message = row.get("message")
     if isinstance(message, dict):
         return message.get("content")
+    attachment = row.get("attachment")
+    if isinstance(attachment, dict):
+        # A task notification that lands while the turn is still running is
+        # attached to the running turn instead of arriving as a user row.
+        if (
+            attachment.get("type") == "queued_command"
+            and attachment.get("commandMode") == "task-notification"
+        ):
+            prompt = attachment.get("prompt")
+            if isinstance(prompt, str):
+                return prompt
     return row.get("content")
 
 def get_user_or_assistant_role_from_row(row: Dict[str, Any]) -> Optional[str]:
@@ -958,6 +969,16 @@ def is_task_notification_row(row: Dict[str, Any]) -> bool:
     if isinstance(origin, dict) and origin.get("kind") == "task-notification":
         return True
 
+    attachment = row.get("attachment")
+    if isinstance(attachment, dict):
+        # Claude Code attaches a completion notification to the running turn
+        # instead of writing a user row when the task finishes mid-turn.
+        if (
+            attachment.get("type") == "queued_command"
+            and attachment.get("commandMode") == "task-notification"
+        ):
+            return True
+
     notification_text = extract_text_from_content(get_content_from_row(row)).lstrip()
     return notification_text.startswith("<task-notification>")
 
@@ -991,6 +1012,44 @@ def get_result_from_task_notification(row: Dict[str, Any]) -> str:
     notification_text = extract_text_from_content(get_content_from_row(row))
     result = _extract_xml_tag_value(notification_text, "result")
     return result if result is not None else notification_text
+
+
+def get_background_task_id_to_tool_use_id(
+    rows: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Map background task ids to the tool_use that launched them.
+
+    Background Bash and MCP tasks notify with only a <task-id>; unlike agent
+    notifications they carry no <tool-use-id>, so the notification cannot be
+    attributed through the notification itself. The launching tool_result
+    names the same task id, which links the late result back to its tool span.
+    """
+    task_ids = set()
+    for row in rows:
+        if not is_task_notification_row(row):
+            continue
+        task_id = get_task_id_from_task_notification(row)
+        if task_id:
+            task_ids.add(task_id)
+    if not task_ids:
+        return {}
+
+    task_id_to_tool_use_id: Dict[str, str] = {}
+    for row in rows:
+        for tool_result_block in get_tool_result_blocks(get_content_from_row(row)):
+            tool_use_id = tool_result_block.get("tool_use_id")
+            if not tool_use_id:
+                continue
+            # Include the structured toolUseResult: Claude Code puts the
+            # background task id there for Bash launches.
+            result_text = json.dumps(
+                [tool_result_block.get("content"), row.get("toolUseResult")],
+                ensure_ascii=False,
+            )
+            for task_id in task_ids:
+                if task_id in result_text:
+                    task_id_to_tool_use_id.setdefault(task_id, str(tool_use_id))
+    return task_id_to_tool_use_id
 
 def _find_pending_agent_turn(
     session_state: SessionState,
@@ -1180,10 +1239,11 @@ def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[
 
     A queued result already fills the launch entry's final_content, so the
     pending-agents check goes clean — yet the turn provably continues: the
-    delivery row and Claude's follow-up response are still outstanding.
-    Queue remove rows carry no notification content and cannot be matched, so
-    a removed notification keeps the gate closed until the turn ends — the
-    safe direction (close-time emission is always correct).
+    delivery row and Claude's follow-up response are still outstanding. A
+    notification that leaves the queue (a remove row that repeats its content)
+    can no longer continue the turn, so it counts as delivered. Remove rows
+    without content cannot be matched and keep the gate closed until the turn
+    ends — the safe direction (close-time emission is always correct).
     """
     queued: List[str] = []
     delivered = set()
@@ -1193,7 +1253,7 @@ def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[
         tool_use_id = get_tool_use_id_from_task_notification(row)
         if not tool_use_id:
             continue
-        if row.get("type") == "queue-operation":
+        if row.get("type") == "queue-operation" and row.get("operation") != "remove":
             queued.append(tool_use_id)
         else:
             delivered.add(tool_use_id)
@@ -1588,6 +1648,10 @@ def get_new_turns_from_transcript(
     if isinstance(held_rows, list) and held_rows:
         rows = held_rows + rows
         session_state.open_turn = {}
+
+    # Background tasks notify with a task-id only; the launching tool_result in
+    # the held or new rows links it to the tool span.
+    task_id_to_tool_use_id.update(get_background_task_id_to_tool_use_id(rows))
 
     deferred_turn_row_lists, rows = resolve_deferred_agent_turns(rows, session_state, task_id_to_tool_use_id)
 
@@ -3367,6 +3431,8 @@ def emit_ready_observations_of_open_turn(
     held_rows = session_state.open_turn.get("rows") if isinstance(session_state.open_turn, dict) else None
     if not isinstance(held_rows, list) or not held_rows:
         return
+    task_id_to_tool_use_id = dict(task_id_to_tool_use_id)
+    task_id_to_tool_use_id.update(get_background_task_id_to_tool_use_id(held_rows))
     _, trailing_turn, _ = assemble_turns(held_rows, task_id_to_tool_use_id)
     if trailing_turn is None:
         return
