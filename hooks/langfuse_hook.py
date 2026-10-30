@@ -1108,8 +1108,11 @@ def get_async_launch_flag_from_row(row: Dict[str, Any]) -> Optional[bool]:
     tool_use_result = row.get("toolUseResult")
     if not isinstance(tool_use_result, dict):
         return None
-    # A teammate launch is async too: its result never carries the final output.
-    if tool_use_result.get("status") in ("async_launched", "teammate_spawned"):
+    # Teammates are not deferred: they never send a task-notification, so
+    # holding their turn until one arrives strands the whole turn when
+    # SessionEnd is cancelled. Emit the turn at Stop and attach the teammate
+    # transcript on a later firing when it is on disk.
+    if tool_use_result.get("status") == "async_launched":
         return True
     return tool_use_result.get("isAsync") is True
 

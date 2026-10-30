@@ -146,9 +146,43 @@ def test_named_teammate_transcript_attaches_to_its_launch_at_session_end_flush(
     isolated_hook_state,
     tmp_path,
 ):
-    """A teammate meta has no toolUseId. The launch input.name
-    attributes its transcript when the deferred turn flushes at SessionEnd."""
+    """A teammate has no task-notification. The turn still ships at its own
+    Stop, and the teammate transcript attaches on a later firing."""
     transcript = tmp_path / "transcript.jsonl"
+    launch_rows = [
+        {"type": "user", "uuid": "user-1", "timestamp": "2026-01-01T00:00:00.000Z",
+         "sessionId": "session-teammate", "message": {"role": "user", "content": "Start a teammate."}},
+        {"type": "assistant", "uuid": "assistant-1", "timestamp": "2026-01-01T00:00:01.000Z",
+         "message": {"id": "msg-1", "role": "assistant", "model": "claude-test",
+                     "content": [{"type": "tool_use", "id": "toolu_builder", "name": "Agent",
+                                  "input": {"name": "builder-issue-4",
+                                            "taskKind": "in_process_teammate",
+                                            "prompt": "Build the fix."}}]}},
+        {"type": "user", "uuid": "tool-result-1", "timestamp": "2026-01-01T00:00:02.000Z",
+         "toolUseResult": {"status": "teammate_spawned", "name": "builder-issue-4",
+                           "agent_id": "builder-issue-4@session-test",
+                           "teammate_id": "builder-issue-4@session-test",
+                           "agent_type": "general-purpose", "team_name": "session-test"},
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_builder",
+              "content": [{"type": "text", "text": "Spawned successfully. agent_id: builder-issue-4@session-test"}]}]}},
+        {"type": "assistant", "uuid": "assistant-2", "timestamp": "2026-01-01T00:00:02.500Z",
+         "message": {"id": "msg-2", "role": "assistant", "model": "claude-test",
+                     "content": [{"type": "text", "text": "The teammate is running."}]}},
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in launch_rows) + "\n", encoding="utf-8")
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+
+    # First Stop: a teammate sends no task-notification. The turn must still
+    # ship instead of waiting for one; the teammate transcript is not on disk
+    # yet, so its span cannot be emitted in this firing.
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-teammate", transcript)
+    names = [observation.name for observation in fake_langfuse.observations]
+    assert "Conversational Turn" in names
+    assert "Tool: Agent" in names
+    assert "Subagent: Build issue 4" not in names
+
+    # The teammate transcript lands after the turn's Stop.
     subagent_dir = tmp_path / "transcript" / "subagents"
     subagent_dir.mkdir(parents=True)
     # Meta and launch shapes below are harvested from a real 2.1.238 team session.
@@ -178,41 +212,15 @@ def test_named_teammate_transcript_attaches_to_its_launch_at_session_end_flush(
         ]) + "\n",
         encoding="utf-8",
     )
-    launch_rows = [
-        {"type": "user", "uuid": "user-1", "timestamp": "2026-01-01T00:00:00.000Z",
-         "sessionId": "session-teammate", "message": {"role": "user", "content": "Start a teammate."}},
-        {"type": "assistant", "uuid": "assistant-1", "timestamp": "2026-01-01T00:00:01.000Z",
-         "message": {"id": "msg-1", "role": "assistant", "model": "claude-test",
-                     "content": [{"type": "tool_use", "id": "toolu_builder", "name": "Agent",
-                                  "input": {"name": "builder-issue-4",
-                                            "taskKind": "in_process_teammate",
-                                            "prompt": "Build the fix."}}]}},
-        {"type": "user", "uuid": "tool-result-1", "timestamp": "2026-01-01T00:00:02.000Z",
-         "toolUseResult": {"status": "teammate_spawned", "name": "builder-issue-4",
-                           "agent_id": "builder-issue-4@session-test",
-                           "teammate_id": "builder-issue-4@session-test",
-                           "agent_type": "general-purpose", "team_name": "session-test"},
-         "message": {"role": "user", "content": [
-             {"type": "tool_result", "tool_use_id": "toolu_builder",
-              "content": [{"type": "text", "text": "Spawned successfully. agent_id: builder-issue-4@session-test"}]}]}},
-        {"type": "assistant", "uuid": "assistant-2", "timestamp": "2026-01-01T00:00:02.500Z",
-         "message": {"id": "msg-2", "role": "assistant", "model": "claude-test",
-                     "content": [{"type": "text", "text": "The teammate is running."}]}},
-    ]
-    transcript.write_text("\n".join(json.dumps(row) for row in launch_rows) + "\n", encoding="utf-8")
-    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
 
-    # First Stop: a teammate sends no task-notification. The hook emits nothing.
-    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-teammate", transcript)
-    assert fake_langfuse.observations == []
-
-    # SessionEnd: the hook flushes the deferred turn with the teammate transcript.
+    # SessionEnd: the hook attaches the late teammate transcript to the root
+    # emitted at Stop, without creating a second root.
     hook_module.emit_new_turns_from_transcript(
         fake_langfuse, config, "session-teammate", transcript, flush_deferred_agent_turns=True,
     )
 
     names = [observation.name for observation in fake_langfuse.observations]
-    assert "Conversational Turn" in names
+    assert names.count("Conversational Turn") == 1
     assert "Tool: Agent" in names
     assert "Subagent: Build issue 4" in names
     teammate_span = next(o for o in fake_langfuse.observations if o.name == "Subagent: Build issue 4")
