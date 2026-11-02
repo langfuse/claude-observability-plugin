@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -48,6 +49,10 @@ except ValueError:
 
 MAX_OPERATOR_TAGS = 20
 MAX_OPERATOR_TAG_CHARS = 200
+
+# Ceiling for the CC_LANGFUSE_HEADERS_COMMAND helper: the Stop hook runs every
+# turn, so a wedged helper must not hold the turn open.
+HEADERS_COMMAND_TIMEOUT = 10
 
 # Bound for unresolved task notifications kept in the state file between runs.
 MAX_PENDING_TASK_NOTIFICATIONS = 50
@@ -366,6 +371,48 @@ try:
 except Exception:
     LangfuseMedia = None
 
+def resolve_additional_headers() -> Optional[Dict[str, str]]:
+    """Extra headers for every Langfuse request, for installs behind an auth proxy.
+
+    CC_LANGFUSE_HEADERS_COMMAND runs a command whose stdout is a JSON object of
+    header name -> value. It is re-read on every hook run, so a short-lived proxy
+    token stays fresh without the SDK needing callable headers. `shell=True` is
+    the same trust level as the hook command itself — both are user config.
+    Precedent: git's credential.helper / GIT_ASKPASS.
+    Fail-open: on any problem, log and return None so tracing still attempts.
+    """
+    cmd = _opt("CC_LANGFUSE_HEADERS_COMMAND")
+    if not cmd:
+        return None
+    try:
+        # capture_output keeps the helper's stdout off the hook's own stdout,
+        # which Claude Code parses as the hook protocol.
+        completed = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            check=True, timeout=HEADERS_COMMAND_TIMEOUT,
+        )
+        parsed = json.loads(completed.stdout)
+        if not isinstance(parsed, dict):
+            info(
+                f"CC_LANGFUSE_HEADERS_COMMAND did not return a JSON object "
+                f"({type(parsed).__name__}); continuing without extra headers"
+            )
+            return None
+        headers = {str(k): str(v) for k, v in parsed.items()}
+    except Exception as e:
+        # Only the exception type and exit status: str(e) of a CalledProcessError
+        # or TimeoutExpired repeats the command line, which may hold a token.
+        status = getattr(e, "returncode", None)
+        detail = f"{type(e).__name__}" + (f", exit {status}" if status is not None else "")
+        info(f"CC_LANGFUSE_HEADERS_COMMAND failed ({detail}); continuing without extra headers")
+        return None
+    if not headers:
+        info("CC_LANGFUSE_HEADERS_COMMAND returned no headers; continuing without extra headers")
+        return None
+    # Key names only: the values are credentials.
+    debug(f"additional headers from command: {sorted(headers)}")
+    return headers
+
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
     # With capture off, stop the SDK from uploading base64 images it finds
     # in span payloads on its own. The SDK reads an empty value as enabled.
@@ -376,6 +423,7 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
             public_key=config.public_key,
             secret_key=config.secret_key,
             host=config.host,
+            additional_headers=resolve_additional_headers(),
         )
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
