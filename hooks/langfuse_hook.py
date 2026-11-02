@@ -46,6 +46,15 @@ try:
 except ValueError:
     MAX_CHARS = 20000
 
+# Idle hours after which a session's held open turn (raw transcript rows) is
+# dropped from the state file. SessionEnd normally clears it, but Claude Code
+# usually cancels that hook during shutdown, so without this every exited
+# session keeps its last turn's rows until the 30-day eviction.
+try:
+    OPEN_TURN_TTL_HOURS = float(_opt("CC_LANGFUSE_OPEN_TURN_TTL_HOURS") or "24")
+except ValueError:
+    OPEN_TURN_TTL_HOURS = 24.0
+
 MAX_OPERATOR_TAGS = 20
 MAX_OPERATOR_TAG_CHARS = 200
 
@@ -599,7 +608,9 @@ def sweep_stale_session_locks(state: Dict[str, Any], cutoff: datetime) -> None:
 def save_hook_state(state: Dict[str, Any]) -> None:
     try:
         # Drop session entries older than 30 days to keep the file bounded.
-        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=30)
+        open_turn_cutoff = now - timedelta(hours=OPEN_TURN_TTL_HOURS)
         for k in list(state.keys()):
             entry = state.get(k)
             if not isinstance(entry, dict):
@@ -613,10 +624,15 @@ def save_hook_state(state: Dict[str, Any]) -> None:
                 continue
             if ts < cutoff:
                 del state[k]
+            elif ts < open_turn_cutoff and entry.get("open_turn"):
+                # Idle session whose SessionEnd never ran: its held rows are
+                # the bulk of the file and will not be continued.
+                entry["open_turn"] = {}
         sweep_stale_session_locks(state, cutoff)
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        # Compact: the file is read and rewritten on every Stop.
+        tmp.write_text(json.dumps(state, separators=(",", ":"), sort_keys=True), encoding="utf-8")
         os.replace(tmp, STATE_FILE)
     except Exception as e:
         debug(f"save_hook_state failed: {e}")
