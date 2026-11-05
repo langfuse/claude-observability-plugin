@@ -55,6 +55,12 @@
       "description": "Include the injected skill instruction text in the Skill tool span output",
       "default": false
     },
+    "CC_LANGFUSE_CAPTURE_TOOL_ARGUMENTS": {
+      "type": "boolean",
+      "title": "Capture tool call arguments",
+      "description": "Show each tool call's input in the session view and in generation inputs and outputs. The tool input is repeated in every later generation of the session, so traces get larger",
+      "default": false
+    },
     "CC_LANGFUSE_CAPTURE_IMAGES": {
       "type": "boolean",
       "title": "Capture images",
