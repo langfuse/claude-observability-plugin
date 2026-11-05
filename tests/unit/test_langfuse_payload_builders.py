@@ -198,3 +198,52 @@ def test_async_final_result_reaches_generation_input_despite_tool_batch(
         "toolu_bg",
     ]
     assert final_generation_results[1]["output"] == "Async final result."
+
+
+# ---- CC_LANGFUSE_CAPTURE_TOOL_ARGUMENTS ----
+
+def test_tool_call_arguments_are_off_by_default(hook_module):
+    assert hook_module.CAPTURE_TOOL_ARGUMENTS is False
+    tool_use = {"id": "t", "name": "Bash", "input": {"command": "ls"}}
+
+    assert hook_module.tool_call_arguments(tool_use) == ""
+
+
+def test_generation_output_carries_arguments_when_capture_is_on(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CAPTURE_TOOL_ARGUMENTS", True)
+    output = hook_module.build_generation_output(
+        "", [{"id": "toolu_bash", "name": "Bash", "input": {"command": "ls -la"}}]
+    )
+
+    assert output["tool_calls"] == [
+        {
+            "id": "toolu_bash",
+            "type": "function",
+            "function": {"name": "Bash", "arguments": json.dumps({"command": "ls -la"})},
+        }
+    ]
+
+
+def test_captured_arguments_obey_max_chars(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CAPTURE_TOOL_ARGUMENTS", True)
+    monkeypatch.setattr(hook_module, "MAX_CHARS", 10)
+    tool_use = {"id": "t", "name": "Bash", "input": {"command": "x" * 100}}
+
+    assert len(hook_module.tool_call_arguments(tool_use)) == 10
+
+
+def test_captured_arguments_are_left_out_when_max_chars_is_zero(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CAPTURE_TOOL_ARGUMENTS", True)
+    monkeypatch.setattr(hook_module, "MAX_CHARS", 0)
+    output = hook_module.build_generation_output(
+        "", [{"id": "t", "name": "Bash", "input": {"command": "ls"}}]
+    )
+
+    assert output["tool_calls"][0]["function"] == {"name": "Bash"}
+
+
+def test_captured_string_input_is_kept_as_is(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CAPTURE_TOOL_ARGUMENTS", True)
+    tool_use = {"id": "t", "name": "Custom", "input": "raw text"}
+
+    assert hook_module.tool_call_arguments(tool_use) == "raw text"

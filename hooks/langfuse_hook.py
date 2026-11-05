@@ -39,6 +39,7 @@ def _opt(name: str) -> str:
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
+CAPTURE_TOOL_ARGUMENTS = _opt("CC_LANGFUSE_CAPTURE_TOOL_ARGUMENTS").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 try:
@@ -2094,16 +2095,34 @@ def build_generation_output(assistant_text: str, tool_uses: List[Dict[str, Any]]
         output["thinking"] = thinking_parts
     if tool_uses:
         # Langfuse renders tool calls only in this nested shape. A flat
-        # id and name pair stays raw JSON in the trace UI.
-        output["tool_calls"] = [
-            {
-                "id": tool_use.get("id"),
-                "type": "function",
-                "function": {"name": tool_use.get("name")},
-            }
-            for tool_use in tool_uses
-        ]
+        # id and name pair stays raw JSON in the trace UI. The history uses
+        # this same builder: the session view links generations only when
+        # each input starts with the previous input and output.
+        tool_calls: List[Dict[str, Any]] = []
+        for tool_use in tool_uses:
+            function: Dict[str, Any] = {"name": tool_use.get("name")}
+            arguments = tool_call_arguments(tool_use)
+            if arguments:
+                function["arguments"] = arguments
+            tool_calls.append({"id": tool_use.get("id"), "type": "function", "function": function})
+        output["tool_calls"] = tool_calls
     return output
+
+
+def tool_call_arguments(tool_use: Dict[str, Any]) -> str:
+    """The tool input as a JSON string, like OpenAI's function.arguments.
+
+    Off unless CC_LANGFUSE_CAPTURE_TOOL_ARGUMENTS is true: the history repeats
+    it in every later generation. Cut to CC_LANGFUSE_MAX_CHARS; 0 sends nothing.
+    """
+    if not CAPTURE_TOOL_ARGUMENTS:
+        return ""
+    tool_input = tool_use.get("input")
+    if tool_input is None:
+        return ""
+    raw = tool_input if isinstance(tool_input, str) else json.dumps(tool_input, ensure_ascii=False)
+    text, _ = truncate_text(raw, MAX_CHARS)
+    return text
 
 
 # ---- Generation input history ----

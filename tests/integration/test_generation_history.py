@@ -477,3 +477,26 @@ def test_a_tool_use_without_a_name_keeps_the_nested_shape_in_the_history(
     assert generation_inputs(fake_langfuse)[1][1]["tool_calls"] == [
         {"id": "toolu-x", "type": "function", "function": {"name": None}}
     ]
+
+
+def test_captured_arguments_keep_each_input_a_prefix_of_the_next(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
+):
+    """The session view joins generations into one thread only on this prefix."""
+    monkeypatch.setattr(hook_module, "CAPTURE_TOOL_ARGUMENTS", True)
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    write_rows(transcript, tool_turn_rows(SESSION, 1) + tool_turn_rows(SESSION, 2))
+
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config_for(hook_module), SESSION, transcript
+    )
+
+    gens = generations(fake_langfuse)
+    assert len(gens) >= 2
+    for prev, cur in zip(gens, gens[1:]):
+        prefix = list(prev.kwargs["input"]) + [prev.kwargs["output"]]
+        assert cur.kwargs["input"][: len(prefix)] == prefix
+    calls = [c for g in gens for c in (g.kwargs["output"] or {}).get("tool_calls", [])]
+    assert calls and all(
+        json.loads(c["function"]["arguments"]) == {"file_path": "README.md"} for c in calls
+    )
