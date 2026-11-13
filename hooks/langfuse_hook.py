@@ -1640,11 +1640,13 @@ def resolve_agent_jsonl_and_id(meta_path: Path) -> Optional[Tuple[Path, str]]:
         agent_id = agent_id[len("agent-"):]
     return jsonl_path, agent_id
 
-def get_agent_launch_tool_use_ids_by_name(transcript_path: Path) -> Dict[str, str]:
-    """Map each agent name to the tool_use id of its launch.
-    The function streams the full transcript. It removes ambiguous names."""
-    mapping: Dict[str, str] = {}
-    ambiguous: set = set()
+def get_subagent_launch_fallbacks(transcript_path: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Find teammate launches by name and forked skill launches by agent id."""
+    teammates: Dict[str, str] = {}
+    ambiguous_names: set = set()
+    skill_tool_use_ids: set = set()
+    forked_skills: Dict[str, str] = {}
+    ambiguous_agent_ids: set = set()
     try:
         with transcript_path.open(encoding="utf-8") as lines:
             for line in lines:
@@ -1657,29 +1659,52 @@ def get_agent_launch_tool_use_ids_by_name(transcript_path: Path) -> Dict[str, st
                     continue
                 if not isinstance(row, dict):
                     continue
-                for tool_use in get_tool_use_blocks(get_content_from_row(row)):
+                content = get_content_from_row(row)
+                for tool_use in get_tool_use_blocks(content):
                     tool_use_id = str(tool_use.get("id") or "")
-                    tool_input = tool_use.get("input")
-                    if tool_use.get("name") not in ("Agent", "Task") or not tool_use_id:
+                    tool_name = tool_use.get("name")
+                    if tool_name == "Skill" and tool_use_id:
+                        skill_tool_use_ids.add(tool_use_id)
+                    if tool_name not in ("Agent", "Task") or not tool_use_id:
                         continue
+                    tool_input = tool_use.get("input")
                     name = tool_input.get("name") if isinstance(tool_input, dict) else None
                     if not isinstance(name, str) or not name:
                         continue
-                    if mapping.get(name, tool_use_id) != tool_use_id:
-                        ambiguous.add(name)
-                    mapping[name] = tool_use_id
+                    if teammates.get(name, tool_use_id) != tool_use_id:
+                        ambiguous_names.add(name)
+                    teammates[name] = tool_use_id
+
+                # A forked Skill reports its agent id on the result row,
+                # while its sibling transcript metadata omits toolUseId.
+                result = row.get("toolUseResult")
+                if not isinstance(result, dict) or result.get("status") != "forked":
+                    continue
+                agent_id = result.get("agentId")
+                blocks = get_tool_result_blocks(content)
+                if not isinstance(agent_id, str) or not agent_id or len(blocks) != 1:
+                    continue
+                tool_use_id = blocks[0].get("tool_use_id")
+                if not isinstance(tool_use_id, str) or tool_use_id not in skill_tool_use_ids:
+                    continue
+                if forked_skills.get(agent_id, tool_use_id) != tool_use_id:
+                    ambiguous_agent_ids.add(agent_id)
+                forked_skills[agent_id] = tool_use_id
     except Exception:
-        return {}
-    return {name: tool_use_id for name, tool_use_id in mapping.items() if name not in ambiguous}
+        return {}, {}
+    return (
+        {name: tool_id for name, tool_id in teammates.items() if name not in ambiguous_names},
+        {agent_id: tool_id for agent_id, tool_id in forked_skills.items() if agent_id not in ambiguous_agent_ids},
+    )
 
 def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
-    """Map launching Agent/Task tool_use ids to their subagent transcripts."""
+    """Map launching tool_use ids to their subagent transcripts."""
     subagent_dir = transcript_path.with_suffix("") / "subagents"
     if not subagent_dir.is_dir():
         return {}
 
     # Build the fallback map only when a meta has no toolUseId.
-    fallback_tool_use_ids: Optional[Dict[str, str]] = None
+    launch_fallbacks: Optional[Tuple[Dict[str, str], Dict[str, str]]] = None
     claimed_twice: set = set()
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]] = {}
     for meta_path in sorted(subagent_dir.glob("*.meta.json")):
@@ -1697,11 +1722,13 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
 
         tool_use_id = metadata.get("toolUseId")
         if not isinstance(tool_use_id, str) or not tool_use_id:
-            if fallback_tool_use_ids is None:
-                fallback_tool_use_ids = get_agent_launch_tool_use_ids_by_name(transcript_path)
-            # A teammate meta carries the launch input.name.
+            if launch_fallbacks is None:
+                launch_fallbacks = get_subagent_launch_fallbacks(transcript_path)
+            teammates, forked_skills = launch_fallbacks
+            tool_use_id = forked_skills.get(agent_id)
             name = metadata.get("name")
-            tool_use_id = fallback_tool_use_ids.get(name) if isinstance(name, str) else None
+            if tool_use_id is None and isinstance(name, str):
+                tool_use_id = teammates.get(name)
         if not tool_use_id:
             info(f"subagent transcript not attributable to a launching tool_use, skipping: {meta_path}")
             continue
@@ -2435,7 +2462,7 @@ def emit_single_tool_observation(
             if cursor.should_emit(f"subagent:{tool_use_id or tool_key}", complete=not subagent_still_running):
                 subagent_end_timestamp = emit_subagent_observations(
                     langfuse,
-                    parent_otel_span,
+                    tool_span._otel_span if tool_name == "Skill" and tool_span is not None else parent_otel_span,
                     subagent,
                     tool_use_timestamp,
                     subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
@@ -2465,7 +2492,10 @@ def emit_single_tool_observation(
     # Exported spans are immutable, so the end time set here must already
     # cover the workflow agents nested under this span.
     tool_end_timestamp = _get_latest_timestamp(
-        tool_result.result_timestamp, tool_use_timestamp, workflow_end_timestamp
+        tool_result.result_timestamp,
+        tool_use_timestamp,
+        workflow_end_timestamp,
+        subagent_end_timestamp if tool_name == "Skill" else None,
     )
     handoff_timestamp = (
         tool_result.result_timestamp
