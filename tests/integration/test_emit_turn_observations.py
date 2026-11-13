@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 
 def test_emit_turn_observations_creates_generation_tool_and_subagent_observations(
     hook_module,
@@ -134,3 +136,78 @@ def test_a_human_wait_on_a_tool_stays_off_the_generation_that_called_it(
 
     # The turn span still covers the whole turn, wait included.
     assert latest_end_timestamp == hook_module.parse_timestamp(WAIT_TURN_END)
+
+
+def test_forked_skill_emits_its_subagent_under_the_skill_tool(
+    hook_module, fixture_transcript_path, fake_langfuse, tmp_path
+):
+    transcript = tmp_path / "transcript.jsonl"
+    rows = [
+        {
+            "type": "user",
+            "timestamp": "2026-01-01T00:02:00Z",
+            "message": {"role": "user", "content": "Review the changes."},
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-01-01T00:02:01Z",
+            "message": {
+                "role": "assistant",
+                "model": "claude-test",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_review",
+                    "name": "Skill",
+                    "input": {"skill": "code-review"},
+                }],
+            },
+        },
+        {
+            "type": "user",
+            "timestamp": "2026-01-01T00:02:07Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_review",
+                    "content": "Review complete.",
+                }],
+            },
+            "toolUseResult": {
+                "success": True,
+                "status": "forked",
+                "commandName": "code-review",
+                "agentId": "review-agent",
+            },
+        },
+    ]
+    transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    subagent_dir = transcript.with_suffix("") / "subagents"
+    subagent_dir.mkdir(parents=True)
+    (subagent_dir / "agent-review-agent.meta.json").write_text(
+        json.dumps({"agentType": "general-purpose", "spawnDepth": 1}), encoding="utf-8"
+    )
+    child = (
+        fixture_transcript_path("async_agent_completed").with_suffix("")
+        / "subagents" / "agent-agent-complete.jsonl"
+    )
+    (subagent_dir / "agent-review-agent.jsonl").write_bytes(child.read_bytes())
+
+    subagents = hook_module.get_subagent_transcripts_by_tool_use_id(transcript)
+    turn = hook_module.build_turns(rows, hook_module.get_task_id_to_tool_use_id(subagents))[0]
+    hook_module.emit_turn_observations(
+        fake_langfuse,
+        fake_langfuse._otel_tracer.start_span(name="parent", start_time=None),
+        turn,
+        hook_module.parse_timestamp(turn.user_msg),
+        subagent_transcripts_by_tool_use_id=subagents,
+    )
+
+    tool = next(o for o in fake_langfuse.observations if o.name == "Tool: Skill")
+    agents = [o for o in fake_langfuse.observations if o.name == "Subagent"]
+    assert len(agents) == 1
+    assert agents[0]._otel_span.parent is tool._otel_span
+    assert any(
+        o.as_type == "generation" and o._otel_span.parent is agents[0]._otel_span
+        for o in fake_langfuse.observations
+    )
