@@ -17,13 +17,13 @@ pytestmark = pytest.mark.skipif(
     reason="the runner needs a POSIX sh and env",
 )
 
-# A fake uv whose `tool dir` probe fails the way an old uv fails on a newer
+# A fake uv whose `cache dir` probe fails the way an old uv fails on a newer
 # user config, unless the call passes --no-config and UV_PREVIEW_FEATURES is
 # unset. Every other call records its arguments, its preview env and the
 # stdin it received.
 FAKE_UV = """#!/bin/sh
 case " $* " in
-  *" tool dir "*)
+  *" cache dir "*)
     case "$UV_MODE" in
       ok) exit 0 ;;
       isolated)

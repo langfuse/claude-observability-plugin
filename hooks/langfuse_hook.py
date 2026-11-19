@@ -357,7 +357,7 @@ except Exception as e:
         "Hint: uv was not found on this PATH. If uv is installed, check that its "
         "location is on the PATH seen by the app that launches Claude Code; "
         "GUI apps often use a minimal PATH. If uv is on that PATH, it could not "
-        "start even without uv config; run `uv tool dir` to see why."
+        "start even without uv config; run `uv cache dir` to see why."
     )
     sys.exit(0)
 

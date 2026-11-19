@@ -11,15 +11,17 @@
 # 3. python3, which logs a hint and exits 0 if langfuse is not importable.
 #
 # Each probe runs before the hook starts, so the hook runs at most once. The
-# probes read no stdin, leaving the hook payload for the hook.
+# probes read no stdin, leaving the hook payload for the hook. `uv cache dir`
+# loads the same user and project config as `uv run`; tool commands such as
+# `uv tool dir` skip project config, so they can fail where `uv run` works.
 
 HOOK="$(dirname "$0")/langfuse_hook.py"
 
 if command -v uv >/dev/null 2>&1; then
-  if uv tool dir </dev/null >/dev/null 2>&1; then
+  if uv cache dir </dev/null >/dev/null 2>&1; then
     exec uv run --quiet --script "$HOOK"
   fi
-  if env -u UV_PREVIEW_FEATURES uv --no-config tool dir </dev/null >/dev/null 2>&1; then
+  if env -u UV_PREVIEW_FEATURES uv --no-config cache dir </dev/null >/dev/null 2>&1; then
     exec env -u UV_PREVIEW_FEATURES uv run --no-config --quiet --script "$HOOK"
   fi
 fi
