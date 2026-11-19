@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import hashlib
+import importlib.util
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -40,6 +41,9 @@ DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+# Secret redaction is on unless explicitly turned off: transcripts carry
+# whatever a session printed, including credentials.
+REDACT_SECRETS = (_opt("CC_LANGFUSE_REDACT_SECRETS") or "true").lower() != "false"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
@@ -366,16 +370,44 @@ try:
 except Exception:
     LangfuseMedia = None
 
+def load_secret_redaction_mask() -> Optional[Any]:
+    """Load the export-stage redaction mask from secret_redaction.py beside this hook.
+
+    Returns None when the module cannot be loaded; the caller then refuses to
+    export rather than sending unredacted transcripts.
+    """
+    module_path = Path(__file__).resolve().parent / "secret_redaction.py"
+    try:
+        spec = importlib.util.spec_from_file_location("langfuse_hook_secret_redaction", module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def log_counts(hits: Any) -> None:
+            info(f"Redacted secrets before export: {module.summarize(hits)}")
+
+        return module.make_mask_otel_spans(on_redaction=log_counts)
+    except Exception as e:
+        info(f"Secret redaction unavailable ({type(e).__name__}: {e}); tracing disabled for this turn")
+        return None
+
+
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
     # With capture off, stop the SDK from uploading base64 images it finds
     # in span payloads on its own. The SDK reads an empty value as enabled.
     if not CAPTURE_IMAGES and not os.environ.get("LANGFUSE_MEDIA_UPLOAD_ENABLED"):
         os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
+    client_kwargs: Dict[str, Any] = {}
+    if REDACT_SECRETS:
+        mask = load_secret_redaction_mask()
+        if mask is None:
+            return None
+        client_kwargs["mask_otel_spans"] = mask
     try:
         return Langfuse(
             public_key=config.public_key,
             secret_key=config.secret_key,
             host=config.host,
+            **client_kwargs,
         )
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
