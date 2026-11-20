@@ -122,6 +122,8 @@ def test_client_creation_failure_is_logged(hook_module: Any, monkeypatch: pytest
             raise RuntimeError("boom")
 
     monkeypatch.setattr(hook_module, "Langfuse", ExplodingLangfuse)
+    # Redaction is covered in test_redaction_wiring.py; isolate the SDK failure here.
+    monkeypatch.setattr(hook_module, "REDACT_SECRETS", False)
     config = hook_module.LangfuseConfig(public_key="pk", secret_key="sk", host="h", user_id=None)
 
     assert hook_module.create_langfuse_client(config) is None
