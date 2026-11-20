@@ -39,6 +39,9 @@ FAKES = {
     "google_api_key": j("AI", "za", B62[:35]),
     "stripe_key": j("sk", "_live_", B62[:28]),
     "npm_token": j("np", "m_", B62[:36]),
+    "slack_webhook": j("https://hooks.", "slack.com/services/", "T00000000/B00000000/", B62[:24]),
+    "pypi_token": j("py", "pi-", "AgEIcHlwaS5vcmc", B62, B62[:10]),
+    "atlassian_api_token": j("ATA", "TT3", B62[:32]),
     "jwt": j("ey", "JhbGciOiJIUzI1NiJ9", ".", "ey", "JzdWIiOiIxMjM0NTY3ODkwIn0", ".", "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"),
 }
 
@@ -89,6 +92,52 @@ def test_url_credentials_keep_user_and_host() -> None:
     assert hits["url_credentials"] == 1
 
 
+SESSION_TOKEN = j("IQoJb3JpZ2luX2Vj", "EXAMPLE", B62[:40], "%2F", B62[:20], "%3D")
+SIGNATURE = HEX64
+CREDENTIAL = j("AS", "IAQ7Z3EXAMPLE4R2LM", "%2F20261119%2Fus-east-1%2Fs3%2Faws4_request")
+PRESIGNED = (
+    "https://bucket.s3.us-east-1.amazonaws.com/media/obj.png"
+    "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    f"&X-Amz-Credential={CREDENTIAL}"
+    "&X-Amz-Date=20261119T060000Z&X-Amz-Expires=3600"
+    f"&X-Amz-Security-Token={SESSION_TOKEN}"
+    "&X-Amz-SignedHeaders=host"
+    f"&X-Amz-Signature={SIGNATURE}"
+)
+
+
+def test_presigned_url_redacts_token_signature_and_credential() -> None:
+    redacted, hits = sr.redact_text(f"PUT {PRESIGNED} -> 403")
+    for secret in (SESSION_TOKEN, SIGNATURE, CREDENTIAL):
+        assert_clean(redacted, secret)
+    assert hits["aws_presigned_url"] == 3
+    # Non-secret parts stay readable for debugging.
+    assert "bucket.s3.us-east-1.amazonaws.com/media/obj.png" in redacted
+    assert "X-Amz-Expires=3600" in redacted
+    assert redacted.endswith(" -> 403")
+
+
+def test_presigned_url_inside_json_stays_valid_json() -> None:
+    payload = json.dumps({"stderr": f"upload failed: {PRESIGNED}"})
+    escaped = payload.replace("&", "\\u0026")
+    for value in (payload, escaped):
+        redacted, hits = sr.redact_attribute_value(value)
+        assert SESSION_TOKEN not in redacted and SIGNATURE not in redacted
+        assert hits["aws_presigned_url"] == 3
+        json.loads(redacted)
+
+
+def test_security_token_header_is_redacted() -> None:
+    redacted, hits = sr.redact_text(f"x-amz-security-token: {SESSION_TOKEN}")
+    assert redacted == "x-amz-security-token: [REDACTED:aws_presigned_url]"
+    assert hits["aws_presigned_url"] == 1
+
+
+def test_unsigned_s3_url_is_kept() -> None:
+    url = "https://bucket.s3.amazonaws.com/key.png?versionId=abc123&X-Amz-Expires=60"
+    assert sr.redact_text(url) == (url, Counter())
+
+
 def test_netsuite_tba_secret_near_its_label() -> None:
     redacted, hits = sr.redact_text(f"NETSUITE_TOKEN_SECRET={HEX64}")
     assert_clean(redacted, HEX64)
@@ -109,11 +158,12 @@ def test_bare_hex_without_a_credential_label_is_kept() -> None:
         "PASSWORD=hunter2hunter2",
         "client_secret: hunter2hunter2",
         '{"api_key": "hunter2hunter2"}',
+        "password=Pa55.word99x",
     ],
 )
 def test_credential_assignments(text: str) -> None:
     redacted, hits = sr.redact_text(text)
-    assert "hunter2hunter2" not in redacted
+    assert text.split("=")[-1].split(":")[-1].strip(' "}') not in redacted
     assert hits["credential_assignment"] == 1
 
 
@@ -127,12 +177,21 @@ def test_credential_assignments(text: str) -> None:
         "token_secret=xxxxxxxxxxxx",
         "the password field is required",
         "def check_password(value):",
+        "Langfuse(secret_key=secret_key)",
+        "client = Langfuse(secret_key=config.secret_key)",
+        "api_key: settings.OPENAI_API_KEY",
     ],
 )
 def test_placeholders_and_prose_are_kept(text: str) -> None:
     redacted, hits = sr.redact_text(text)
     assert redacted == text
     assert not hits
+
+
+def test_every_rule_has_triggers_it_can_match() -> None:
+    for rule_id, _pattern, triggers in sr._RULES:
+        assert triggers, rule_id
+        assert all(t == t.lower() for t in triggers), rule_id
 
 
 def test_ordinary_text_is_untouched() -> None:

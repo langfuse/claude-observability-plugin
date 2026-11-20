@@ -10,8 +10,11 @@ Design rules:
 
 - Standard library only. The hook is a single uv script with no package, and
   this module sits next to it.
-- One combined regular expression, so a multi-megabyte attribute is scanned in
-  one pass.
+- Cheap before exact. Every rule lists literal triggers that any match must
+  contain; its regular expression runs only when a trigger appears in the
+  lower-cased text. A multi-megabyte attribute is mostly handled by substring
+  searches, which matters because the mask runs inside the hook's flush window.
+- Rules run in order, so a more specific rule claims text before a broader one.
 - Replacements contain no quotes or backslashes, so a JSON-encoded attribute
   stays parseable. If a replacement would still break valid JSON, the whole
   attribute is replaced instead.
@@ -30,7 +33,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 REDACTION_MARKER = "[REDACTED:{rule}]"
 FAILURE_MARKER = "[REDACTED:redaction_error]"
@@ -55,93 +58,110 @@ _PLACEHOLDER_VALUE = re.compile(
     re.IGNORECASE,
 )
 
-# (rule id, pattern). A pattern with a group named `v` redacts only that group;
-# otherwise the whole match is redacted. Group names are rewritten per rule
-# when the patterns are combined, so every rule may use `v`.
-_RULES: Tuple[Tuple[str, str], ...] = (
+# Values that are code, not secrets: an identifier or attribute path that itself
+# names a credential, as in `secret_key=secret_key` or `api_key=settings.API_KEY`.
+# Matched whole, case-insensitively.
+_REFERENCE_VALUE = re.compile(
+    r"(?:[a-z_][a-z0-9_]*\.)*[a-z_]*(?:" + _SECRET_KEY_NAMES + r")[a-z0-9_]*",
+    re.IGNORECASE,
+)
+
+# (rule id, pattern, triggers). A pattern with a group named `v` redacts only
+# that group; otherwise the whole match is redacted. Triggers are lower-case
+# substrings, at least one of which every match contains; they must stay a
+# superset of what the pattern can match, or the rule silently stops firing.
+_RULES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     (
         "private_key",
         r"-----BEGIN[A-Z0-9 ]*PRIVATE KEY-----[^\"]{0,8000}?(?:-----END[A-Z0-9 ]*PRIVATE KEY-----|(?=\")|$)",
+        ("private key",),
     ),
-    ("aws_access_key_id", r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"),
+    (
+        # SigV4 presigned URLs (query string, also JSON-escaped `&`) and the
+        # `x-amz-security-token` header. The session token grants the signer's
+        # role until it expires, so the URL is a live credential.
+        "aws_presigned_url",
+        r"(?i:(?:[?&]|\\u0026)X-Amz-(?:Security-Token|Signature|Credential)="
+        r"|\bx-amz-security-token\\?[\"']?\s*:\s*\\?[\"']?)"
+        r"(?P<v>[^&\s\"'\\<>]{8,})",
+        ("x-amz-",),
+    ),
+    ("aws_access_key_id", r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b", ("akia", "asia", "abia", "acca")),
     (
         "aws_secret_access_key",
         r"(?i:aws_?secret_?access_?key|aws_?secret_?key|secret_?access_?key)"
         r"\\?[\"']?\s*[:=]\s*\\?[\"']?(?P<v>[A-Za-z0-9/+]{40})(?![A-Za-z0-9/+])",
+        ("secret",),
     ),
-    ("github_token", r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{60,255})\b"),
-    ("gitlab_token", r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
-    ("slack_token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
-    ("slack_webhook", r"https://hooks\.slack\.com/services/[A-Za-z0-9_/]{20,}"),
-    ("langfuse_secret_key", r"\bsk-lf-[0-9a-fA-F-]{36}\b"),
-    ("anthropic_api_key", r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
-    ("openai_api_key", r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}"),
-    ("google_api_key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
-    ("stripe_key", r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{24,}\b"),
-    ("npm_token", r"\bnpm_[A-Za-z0-9]{36}\b"),
-    ("pypi_token", r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}"),
-    ("atlassian_api_token", r"\bATATT3[A-Za-z0-9_=-]{30,}"),
-    ("jwt", r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    ("github_token", r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{60,255})\b", ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")),
+    ("gitlab_token", r"\bglpat-[A-Za-z0-9_-]{20,}\b", ("glpat-",)),
+    ("slack_token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}", ("xox",)),
+    ("slack_webhook", r"https://hooks\.slack\.com/services/[A-Za-z0-9_/]{20,}", ("hooks.slack.com",)),
+    ("langfuse_secret_key", r"\bsk-lf-[0-9a-fA-F-]{36}\b", ("sk-lf-",)),
+    ("anthropic_api_key", r"\bsk-ant-[A-Za-z0-9_-]{20,}", ("sk-ant-",)),
+    ("openai_api_key", r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}", ("sk-",)),
+    ("google_api_key", r"\bAIza[0-9A-Za-z_-]{35}\b", ("aiza",)),
+    ("stripe_key", r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{24,}\b", ("_live_", "_test_")),
+    ("npm_token", r"\bnpm_[A-Za-z0-9]{36}\b", ("npm_",)),
+    ("pypi_token", r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}", ("pypi-",)),
+    ("atlassian_api_token", r"\bATATT3[A-Za-z0-9_=-]{30,}", ("atatt3",)),
+    ("jwt", r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", ("eyj",)),
     (
         "url_credentials",
         r"(?<=://)[^/\s:@\"'\\]+:(?P<v>[^@\s/\"'\\]{3,})(?=@)",
+        ("://",),
     ),
-    ("bearer_token", r"(?i:\bbearer)\s+(?P<v>[A-Za-z0-9._~+/=-]{20,})"),
-    ("basic_auth", r"(?i:\bbasic)\s+(?P<v>[A-Za-z0-9+/]{16,}={0,2})(?![A-Za-z0-9+/=])"),
+    ("bearer_token", r"(?i:\bbearer)\s+(?P<v>[A-Za-z0-9._~+/=-]{20,})", ("bearer",)),
+    ("basic_auth", r"(?i:\bbasic)\s+(?P<v>[A-Za-z0-9+/]{16,}={0,2})(?![A-Za-z0-9+/=])", ("basic",)),
     (
         "netsuite_tba_secret",
         r"(?i:netsuite|token[_ -]?id|token[_ -]?secret|consumer[_ -]?key|consumer[_ -]?secret)"
         r"[^\"\n]{0,40}?\b(?P<v>[0-9a-fA-F]{64})\b",
+        ("netsuite", "token", "consumer"),
     ),
     (
         "credential_assignment",
         r"(?i:\b(?:" + _SECRET_KEY_NAMES + r"))\\?[\"']?\s*[:=]\s*\\?[\"']?"
         r"(?P<v>[^\s\"'\\,;)}\]]{8,})",
+        ("pass", "pwd", "secret", "key", "token"),
     ),
 )
 
 
-def _compile(rules: Iterable[Tuple[str, str]]) -> Tuple["re.Pattern[str]", Tuple[str, ...]]:
-    """Combine the rules into one alternation with a named group per rule."""
-    parts = []
-    rule_ids = []
-    for index, (rule_id, pattern) in enumerate(rules):
-        rule_ids.append(rule_id)
-        value_group = f"v{index}"
-        parts.append(f"(?P<r{index}>{pattern.replace('(?P<v>', f'(?P<{value_group}>')})")
-    return re.compile("|".join(parts)), tuple(rule_ids)
+_COMPILED: Tuple[Tuple[str, "re.Pattern[str]", Tuple[str, ...]], ...] = tuple(
+    (rule_id, re.compile(pattern), triggers) for rule_id, pattern, triggers in _RULES
+)
 
 
-_COMBINED, _RULE_IDS = _compile(_RULES)
-
-
-def redact_text(text: str) -> Tuple[str, Counter]:
-    """Return `text` with credentials replaced, and a count of hits per rule."""
-    hits: Counter = Counter()
+def _replacer(rule_id: str, hits: Counter) -> Callable[["re.Match[str]"], str]:
+    marker = REDACTION_MARKER.format(rule=rule_id)
 
     def replace(match: "re.Match[str]") -> str:
-        index = int(match.lastgroup[1:]) if match.lastgroup else -1
-        # `lastgroup` is the outermost group that closed last, which is the
-        # rule group `r<index>`; fall back to a scan if the regex engine ever
-        # reports the inner value group.
-        if index < 0 or match.group(f"r{index}") is None:
-            index = next(i for i in range(len(_RULE_IDS)) if match.group(f"r{i}") is not None)
-        rule_id = _RULE_IDS[index]
-        marker = REDACTION_MARKER.format(rule=rule_id)
-        value_group = f"v{index}"
-        if value_group in match.re.groupindex and match.group(value_group) is not None:
-            value = match.group(value_group)
-            if _PLACEHOLDER_VALUE.match(value):
+        if "v" in match.re.groupindex and match.group("v") is not None:
+            value = match.group("v")
+            if _PLACEHOLDER_VALUE.match(value) or _REFERENCE_VALUE.fullmatch(value):
                 return match.group(0)
             hits[rule_id] += 1
-            start = match.start(value_group) - match.start(0)
-            end = match.end(value_group) - match.start(0)
+            start = match.start("v") - match.start(0)
+            end = match.end("v") - match.start(0)
             whole = match.group(0)
             return whole[:start] + marker + whole[end:]
         hits[rule_id] += 1
         return marker
 
-    return _COMBINED.sub(replace, text), hits
+    return replace
+
+
+def redact_text(text: str) -> Tuple[str, Counter]:
+    """Return `text` with credentials replaced, and a count of hits per rule."""
+    hits: Counter = Counter()
+    # Redaction only removes text, so triggers checked against the original
+    # can only over-report, never miss.
+    folded = text.lower()
+    for rule_id, pattern, triggers in _COMPILED:
+        if any(trigger in folded for trigger in triggers):
+            text = pattern.sub(_replacer(rule_id, hits), text)
+    return text, hits
 
 
 def _is_json(text: str) -> bool:
