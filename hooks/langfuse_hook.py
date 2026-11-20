@@ -3566,5 +3566,19 @@ def main() -> int:
     finally:
         flush_and_shutdown_langfuse_client(langfuse)
 
+def hard_exit(code: int) -> None:
+    """Exit now, without running atexit handlers.
+
+    The SDK registers an atexit shutdown that drains its upload queues with no
+    time limit, so an unreachable host would hold the hook (and Claude Code's
+    turn) for minutes after the capped flush above has already given up.
+    """
+    logging.shutdown()
+    with contextlib.suppress(Exception):
+        sys.stdout.flush()
+        sys.stderr.flush()
+    os._exit(code)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    hard_exit(main())
