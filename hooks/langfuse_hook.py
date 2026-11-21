@@ -313,7 +313,9 @@ def _get_logger() -> Optional[logging.Logger]:
         lg = logging.getLogger("langfuse_hook")
         lg.setLevel(logging.DEBUG if DEBUG else logging.INFO)
         if not lg.handlers:
-            h = RotatingFileHandler(str(LOG_FILE), maxBytes=5_000_000, backupCount=3)
+            h = RotatingFileHandler(
+                str(LOG_FILE), maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+            )
             h.setFormatter(logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
