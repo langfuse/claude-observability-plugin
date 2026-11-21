@@ -454,34 +454,66 @@ def get_session_lock_path(key: str) -> Path:
     return STATE_DIR / f"langfuse_state.{key[:16]}.lock"
 
 
+try:
+    import fcntl  # Unix
+except ImportError:
+    fcntl = None
+try:
+    import msvcrt  # Windows
+except ImportError:
+    msvcrt = None
+
+
 class FileLock:
+    """Exclusive lock on a lock file, shared across processes.
+
+    Unix uses flock on the whole file. Windows uses msvcrt.locking on byte 0,
+    which differs from flock: the lock covers a range starting at the file
+    position, it blocks reads and writes of that byte by other handles, and
+    unlocking a range that is not held fails. So the handle seeks to 0
+    before locking and unlocking, lock files are never read or written, and
+    only a held lock is unlocked.
+    """
+
     def __init__(self, path: Path, timeout_s: float = 2.0):
         self.path = path
         self.timeout_s = timeout_s
         self._fh = None
+        self.acquired = False
+
+    def _try_lock(self) -> bool:
+        if fcntl is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+        # "a+" opens at the end of the file; the lock always covers byte 0.
+        self._fh.seek(0)
+        try:
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except PermissionError:
+            # EACCES: another handle holds byte 0. LK_NBLCK does not retry.
+            return False
+        return True
 
     def __enter__(self):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.path, "a+", encoding="utf-8")
         self.acquired = False
-        try:
-            import fcntl  # Unix only
-        except ImportError:
-            # No fcntl available (e.g. Windows) — proceed without lock.
+        if fcntl is None and msvcrt is None:
+            # No lock primitive on this platform — proceed without lock.
             return self
         deadline = time.time() + self.timeout_s
         try:
-            while True:
-                try:
-                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self.acquired = True
-                    return self
-                except BlockingIOError:
-                    if time.time() > deadline:
-                        raise TimeoutError(
-                            f"could not acquire {self.path} within {self.timeout_s}s"
-                        )
-                    time.sleep(0.05)
+            while not self._try_lock():
+                if time.time() > deadline:
+                    raise TimeoutError(
+                        f"could not acquire {self.path} within {self.timeout_s}s"
+                    )
+                time.sleep(0.05)
+            self.acquired = True
+            return self
         except BaseException:
             # __exit__ is not called when __enter__ raises — close the fh
             # we just opened so it doesn't leak.
@@ -493,11 +525,16 @@ class FileLock:
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            import fcntl
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            if self.acquired:
+                if fcntl is not None:
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                else:
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
         except Exception:
             pass
         try:
+            # Closing also releases the lock, even if the unlock above failed.
             self._fh.close()
         except Exception:
             pass
