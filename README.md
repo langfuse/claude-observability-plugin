@@ -95,6 +95,7 @@ process so Claude Code's shutdown cannot cut the final export short.
 | --- | --- | --- |
 | `CC_LANGFUSE_FLUSH_TIMEOUT_S` | `120` | How long a firing waits for its export to be confirmed |
 | `CC_LANGFUSE_EXPORT_TIMEOUT_S` | `30` | Timeout of a single OTLP export request |
+| `CC_LANGFUSE_MAX_REQUEST_MB` | `8` | Exports are split into requests of at most this size |
 | `CC_LANGFUSE_NO_DETACH` | `false` | Run SessionEnd inline instead of in a detached process |
 
 Turns lost by earlier versions can be recovered with
