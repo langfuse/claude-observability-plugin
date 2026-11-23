@@ -82,6 +82,29 @@ disabled, or no usable runtime was found. Run `claude plugin list` from the
 directory you work in, and put uv on the `PATH` of the app that starts Claude
 Code.
 
+### Delivery guarantees
+
+The hook saves its progress only after Langfuse confirms the export. A firing
+whose export fails or times out logs `export NOT confirmed, will retry` and
+leaves its turns pending; the next firing sends them again. Span ids are
+derived from each observation's identity, so a retry overwrites what already
+arrived instead of duplicating it. SessionEnd hands its work to a detached
+process so Claude Code's shutdown cannot cut the final export short.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `CC_LANGFUSE_FLUSH_TIMEOUT_S` | `120` | How long a firing waits for its export to be confirmed |
+| `CC_LANGFUSE_EXPORT_TIMEOUT_S` | `30` | Timeout of a single OTLP export request |
+| `CC_LANGFUSE_NO_DETACH` | `false` | Run SessionEnd inline instead of in a detached process |
+
+Turns lost by earlier versions can be recovered with
+`scripts/backfill_missing_turns.py`. It sends only the turns Langfuse does not
+have yet and dry-runs unless given `--apply`:
+
+```bash
+LANGFUSE_SECRET_KEY=sk-lf-... uv run --script scripts/backfill_missing_turns.py --days 30
+```
+
 ## Contributing
 
 See the [contributing guide](./CONTRIBUTING.md).
