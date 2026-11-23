@@ -484,6 +484,19 @@ class ExportLedger:
         self.exported = 0
         self.failed = 0
         self.oversized = 0
+        # Spans that ended (counted by a span processor). Spans the SDK's
+        # batch queue drops never reach the exporter, so ended > delivered
+        # reveals them.
+        self.counting = False
+        self.ended = 0
+
+    def record_ended(self) -> None:
+        with self.lock:
+            self.ended += 1
+
+    def undelivered(self) -> int:
+        with self.lock:
+            return self.ended - (self.exported + self.failed + self.oversized)
 
     def record_oversized(self, count: int) -> None:
         with self.lock:
@@ -636,7 +649,33 @@ def confirm_export(langfuse: Optional[Any], timeout_s: float = FLUSH_TIMEOUT_S) 
     if not outcome["flushed"]:
         info("Langfuse flush timed out inside the SDK")
         return False
+    if EXPORT_LEDGER.counting and EXPORT_LEDGER.available:
+        missing = EXPORT_LEDGER.undelivered()
+        if missing > 0:
+            info(f"{missing} span(s) never reached the exporter (dropped by the SDK queue)")
+            return False
     return EXPORT_LEDGER.failed == 0
+
+
+def install_end_counter(langfuse: Any) -> None:
+    """Count ended spans so queue drops show up in confirm_export."""
+    try:
+        from opentelemetry.sdk.trace import SpanProcessor
+    except Exception:
+        return
+    provider = getattr(getattr(langfuse, "_resources", None), "tracer_provider", None)
+    if provider is None or not hasattr(provider, "add_span_processor"):
+        return
+
+    class EndCounter(SpanProcessor):
+        def on_end(self, span: Any) -> None:
+            EXPORT_LEDGER.record_ended()
+
+    try:
+        provider.add_span_processor(EndCounter())
+        EXPORT_LEDGER.counting = True
+    except Exception as e:
+        debug(f"end counter unavailable: {e}")
 
 
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
@@ -655,6 +694,9 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
         span_exporter = None
     if span_exporter is not None:
         reliability_kwargs["span_exporter"] = span_exporter
+    # The SDK's batch queue defaults to 2048 spans and silently drops the
+    # rest; a resumed long session emits far more in one firing.
+    os.environ.setdefault("OTEL_BSP_MAX_QUEUE_SIZE", "1000000")
     try:
         try:
             langfuse = Langfuse(
@@ -678,6 +720,7 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
         if id_generator is not None and tracer is not None and hasattr(tracer, "id_generator") \
                 and tracer.id_generator is not id_generator:
             tracer.id_generator = id_generator
+        install_end_counter(langfuse)
         return langfuse
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")

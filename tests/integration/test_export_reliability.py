@@ -222,6 +222,16 @@ def test_confirm_export_fails_when_sdk_flush_times_out(hook_module, fresh_ledger
     assert hook_module.confirm_export(_client(_Provider(False)), timeout_s=1) is False
 
 
+def test_confirm_export_fails_when_spans_never_reached_exporter(hook_module, fresh_ledger):
+    fresh_ledger.counting = True
+    for _ in range(5):
+        fresh_ledger.record_ended()
+    fresh_ledger.record(3, ok=True)  # 2 spans dropped by the SDK queue
+    assert hook_module.confirm_export(_client(_Provider(True)), timeout_s=1) is False
+    fresh_ledger.record(2, ok=True)
+    assert hook_module.confirm_export(_client(_Provider(True)), timeout_s=1) is True
+
+
 def test_confirm_export_fails_when_flush_hangs(hook_module, fresh_ledger):
     release = threading.Event()
     try:

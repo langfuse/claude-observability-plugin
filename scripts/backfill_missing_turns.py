@@ -146,6 +146,9 @@ def main() -> int:
     parser.add_argument("--days", type=int, default=30, help="only transcripts modified in the last N days")
     parser.add_argument("--session", help="only this session id")
     parser.add_argument("--apply", action="store_true", help="actually send (default: dry run)")
+    parser.add_argument("--all-turns", action="store_true",
+                        help="re-send every turn, not just missing ones. Only for sessions sent entirely "
+                             "by this version (deterministic ids); older turns would be duplicated")
     parser.add_argument("--flush-timeout", type=float, default=1800.0,
                         help="seconds to wait for one session's export (long sessions are large)")
     parser.add_argument("--skip-active-minutes", type=int, default=60,
@@ -196,7 +199,7 @@ def main() -> int:
         planned: list = []
 
         def selective_emit_turn(lf, sid, turn_num, turn, *a, **kw):
-            if turn_num in present:
+            if turn_num in present and not args.all_turns:
                 return dict(kw.get("progress") or {})
             planned.append(turn_num)
             if not args.apply:
@@ -204,7 +207,9 @@ def main() -> int:
             return original_emit_turn(lf, sid, turn_num, turn, *a, **kw)
 
         hook.emit_turn = selective_emit_turn
-        hook.EXPORT_LEDGER.failed = 0
+        ledger = hook.EXPORT_LEDGER
+        with ledger.lock:
+            ledger.exported = ledger.failed = ledger.oversized = ledger.ended = 0
         confirmed = {"ok": True}
 
         def gate() -> bool:
