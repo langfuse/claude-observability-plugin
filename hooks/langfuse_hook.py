@@ -12,10 +12,10 @@ Claude Code -> Langfuse hook
 
 import base64
 import contextlib
+import contextvars
 import json
 import logging
 import os
-import random
 import sys
 import threading
 import time
@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 # ----------------- Configuration -----------------
@@ -45,6 +45,27 @@ try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
     MAX_CHARS = 20000
+
+def _positive_float_opt(name: str, default: float) -> float:
+    try:
+        value = float(_opt(name) or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+# Upper bound for confirming that a firing's spans reached Langfuse. The Stop
+# hook runs async and the SessionEnd work runs in a detached worker, so this
+# budget never blocks Claude Code.
+FLUSH_TIMEOUT_S = _positive_float_opt("CC_LANGFUSE_FLUSH_TIMEOUT_S", 120.0)
+# Per-request timeout of the OTLP export (the SDK default of 5s is too short
+# for large backlogs, especially with image capture on).
+EXPORT_REQUEST_TIMEOUT_S = int(_positive_float_opt("CC_LANGFUSE_EXPORT_TIMEOUT_S", 30.0))
+# Target size of one OTLP export request; batches are split to stay below it.
+MAX_REQUEST_BYTES = int(_positive_float_opt("CC_LANGFUSE_MAX_REQUEST_MB", 8.0) * 1024 * 1024)
+# The OTLP HTTP exporter's own limit; a single span above it is undeliverable.
+HARD_REQUEST_LIMIT_BYTES = 64 * 1024 * 1024
+# Set on the detached worker that SessionEnd hands its work to.
+DETACHED_WORKER_ENV = "CC_LANGFUSE_DETACHED_WORKER"
 
 MAX_OPERATOR_TAGS = 20
 MAX_OPERATOR_TAG_CHARS = 200
@@ -366,17 +387,341 @@ try:
 except Exception:
     LangfuseMedia = None
 
+
+# ----------------- Export reliability -----------------
+# Progress is committed to the state file only after the firing's spans are
+# confirmed exported; an unconfirmed firing leaves the state untouched and the
+# next firing re-emits the same turns. Re-emission is idempotent because span
+# ids are derived deterministically from the observation's identity (Langfuse
+# upserts observations by id), so a retry overwrites instead of duplicating.
+
+# Seed for the next span id; set around tracer.start_span by _start_backdated.
+_SPAN_ID_SEED: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "cc_langfuse_span_id_seed", default=None
+)
+# Disambiguates otherwise identical observations within one firing. Emission
+# order is transcript order, so a retry from the same state reproduces it.
+_SPAN_SEED_OCCURRENCES: Dict[str, int] = {}
+# Metadata fields that identify an observation (stable across firings).
+_IDENTITY_METADATA_KEYS = ("tool_id", "agent_id")
+
+
+def span_id_from_seed(seed: str) -> int:
+    return int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16], 16) or 1
+
+
+def phantom_span_id(trace_id_hex: str) -> int:
+    """Span id of a never-exported carrier parent, stable per trace."""
+    return span_id_from_seed(f"phantom:{trace_id_hex}")
+
+
+def _stable_digest(value: Any) -> str:
+    try:
+        # Non-JSON values (e.g. LangfuseMedia) collapse to their type name:
+        # their repr carries a memory address that differs between runs.
+        raw = json.dumps(value, sort_keys=True, ensure_ascii=False,
+                         default=lambda o: f"<{type(o).__name__}>")
+    except Exception:
+        raw = f"<{type(value).__name__}>"
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def build_span_seed(*, trace_id_hex: Optional[str], parent_span_id_hex: Optional[str],
+                    name: str, as_type: str, start_ns: Optional[int],
+                    obs_kwargs: Dict[str, Any]) -> Optional[str]:
+    """Deterministic identity of an observation, or None (random id)."""
+    if not trace_id_hex:
+        return None
+    metadata = obs_kwargs.get("metadata")
+    identity = {}
+    if isinstance(metadata, dict):
+        identity = {k: metadata.get(k) for k in _IDENTITY_METADATA_KEYS if metadata.get(k)}
+    base = "|".join([
+        trace_id_hex,
+        parent_span_id_hex or "",
+        name,
+        as_type,
+        str(start_ns),
+        _stable_digest(obs_kwargs.get("input")),
+        _stable_digest(identity),
+    ])
+    occurrence = _SPAN_SEED_OCCURRENCES.get(base, 0)
+    _SPAN_SEED_OCCURRENCES[base] = occurrence + 1
+    return f"{base}|{occurrence}"
+
+
+@contextlib.contextmanager
+def seeded_span_id(seed: Optional[str]):
+    token = _SPAN_ID_SEED.set(seed)
+    try:
+        yield
+    finally:
+        _SPAN_ID_SEED.reset(token)
+
+
+def make_seeded_id_generator() -> Optional[Any]:
+    try:
+        from opentelemetry.sdk.trace.id_generator import RandomIdGenerator
+    except Exception:
+        return None
+
+    class SeededIdGenerator(RandomIdGenerator):
+        def generate_span_id(self) -> int:
+            seed = _SPAN_ID_SEED.get()
+            if seed:
+                return span_id_from_seed(seed)
+            return super().generate_span_id()
+
+    return SeededIdGenerator()
+
+
+class ExportLedger:
+    """Counts what the exporter actually delivered during this process."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.available = False  # True once the recording exporter is wired in
+        self.exported = 0
+        self.failed = 0
+        self.oversized = 0
+        # Spans that ended (counted by a span processor). Spans the SDK's
+        # batch queue drops never reach the exporter, so ended > delivered
+        # reveals them.
+        self.counting = False
+        self.ended = 0
+
+    def record_ended(self) -> None:
+        with self.lock:
+            self.ended += 1
+
+    def undelivered(self) -> int:
+        with self.lock:
+            return self.ended - (self.exported + self.failed + self.oversized)
+
+    def record_oversized(self, count: int) -> None:
+        with self.lock:
+            self.oversized += count
+
+    def record(self, count: int, ok: bool) -> None:
+        with self.lock:
+            if ok:
+                self.exported += count
+            else:
+                self.failed += count
+
+
+EXPORT_LEDGER = ExportLedger()
+
+
+def split_into_requests(spans: Any, size_of: Callable[[Any], int], max_bytes: int,
+                        hard_limit: int) -> Tuple[List[List[Any]], List[Tuple[Any, int]]]:
+    """Group spans into requests of at most max_bytes (a single larger span
+    gets a request of its own); spans above hard_limit are returned apart."""
+    chunks: List[List[Any]] = []
+    oversized: List[Tuple[Any, int]] = []
+    current: List[Any] = []
+    current_size = 0
+    for span in spans:
+        size = size_of(span)
+        if size > hard_limit:
+            oversized.append((span, size))
+            continue
+        if current and current_size + size > max_bytes:
+            chunks.append(current)
+            current, current_size = [], 0
+        current.append(span)
+        current_size += size
+    if current:
+        chunks.append(current)
+    return chunks, oversized
+
+
+def build_recording_span_exporter(config: "LangfuseConfig") -> Optional[Any]:
+    """The SDK's default OTLP exporter, wrapped to record export outcomes.
+
+    Mirrors the exporter Langfuse builds itself (endpoint, auth and SDK
+    headers) with a longer request timeout. Returns None if the OTel pieces
+    are unavailable; the client then uses its own exporter and export
+    failures stay invisible (only flush timeouts are detected).
+    """
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+    except Exception as e:
+        debug(f"recording exporter unavailable: {e}")
+        return None
+    try:
+        import langfuse as _langfuse_pkg
+        sdk_version = getattr(_langfuse_pkg, "__version__", "unknown")
+    except Exception:
+        sdk_version = "unknown"
+    auth = base64.b64encode(f"{config.public_key}:{config.secret_key}".encode("utf-8")).decode("ascii")
+    export_path = os.environ.get("LANGFUSE_OTEL_TRACES_EXPORT_PATH") or "api/public/otel/v1/traces"
+    inner = OTLPSpanExporter(
+        endpoint=f"{config.host.rstrip('/')}/{export_path.lstrip('/')}",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "x-langfuse-sdk-name": "python",
+            "x-langfuse-sdk-version": sdk_version,
+            "x-langfuse-public-key": config.public_key,
+        },
+        timeout=EXPORT_REQUEST_TIMEOUT_S,
+    )
+
+    try:
+        from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+    except Exception:
+        encode_spans = None
+
+    def span_size(span: Any) -> int:
+        if encode_spans is None:
+            return 0
+        try:
+            return encode_spans([span]).ByteSize()
+        except Exception:
+            return 0
+
+    class RecordingSpanExporter(SpanExporter):
+        def export(self, spans):  # type: ignore[override]
+            # Generation inputs carry the conversation so far, so one late
+            # turn can serialize to tens of MB; a default 512-span batch then
+            # exceeds the exporter's request limit and is dropped whole.
+            # Split into requests of at most MAX_REQUEST_BYTES.
+            chunks, oversized = split_into_requests(spans, span_size, MAX_REQUEST_BYTES, HARD_REQUEST_LIMIT_BYTES)
+            for span, size in oversized:
+                # Can never be delivered; counting it as a failure would
+                # block the session's progress forever.
+                EXPORT_LEDGER.record_oversized(1)
+                info(f"Dropping span {getattr(span, 'name', '?')!r}: {size} bytes exceeds the "
+                     f"{HARD_REQUEST_LIMIT_BYTES}-byte request limit")
+
+            overall = SpanExportResult.SUCCESS
+            for chunk in chunks:
+                try:
+                    result = inner.export(chunk)
+                except Exception as e:
+                    info(f"Langfuse export raised {type(e).__name__}: {e}")
+                    result = SpanExportResult.FAILURE
+                ok = result == SpanExportResult.SUCCESS
+                EXPORT_LEDGER.record(len(chunk), ok)
+                if not ok:
+                    overall = SpanExportResult.FAILURE
+                    info(f"Langfuse export failed for {len(chunk)} span(s); they will be retried next firing")
+            return overall
+
+        def shutdown(self) -> None:
+            inner.shutdown()
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            return inner.force_flush(timeout_millis)
+
+    EXPORT_LEDGER.available = True
+    return RecordingSpanExporter()
+
+
+def confirm_export(langfuse: Optional[Any], timeout_s: float = FLUSH_TIMEOUT_S) -> bool:
+    """Flush everything emitted so far; True only if it provably arrived."""
+    if langfuse is None:
+        return True
+    outcome = {"flushed": False}
+
+    def _flush() -> None:
+        try:
+            resources = getattr(langfuse, "_resources", None)
+            tracer_provider = getattr(resources, "tracer_provider", None)
+            if tracer_provider is not None and hasattr(tracer_provider, "force_flush"):
+                flushed = tracer_provider.force_flush(int(timeout_s * 1000))
+            else:
+                langfuse.flush()
+                flushed = True
+            # Media uploads and score queues.
+            langfuse.flush()
+            outcome["flushed"] = bool(flushed)
+        except Exception as e:
+            info(f"Langfuse flush raised {type(e).__name__}: {e}")
+
+    t = threading.Thread(target=_flush, daemon=True)
+    t.start()
+    t.join(timeout_s + min(5.0, timeout_s))
+    if t.is_alive():
+        info(f"Langfuse flush did not finish within {timeout_s:.0f}s")
+        return False
+    if not outcome["flushed"]:
+        info("Langfuse flush timed out inside the SDK")
+        return False
+    if EXPORT_LEDGER.counting and EXPORT_LEDGER.available:
+        missing = EXPORT_LEDGER.undelivered()
+        if missing > 0:
+            info(f"{missing} span(s) never reached the exporter (dropped by the SDK queue)")
+            return False
+    return EXPORT_LEDGER.failed == 0
+
+
+def install_end_counter(langfuse: Any) -> None:
+    """Count ended spans so queue drops show up in confirm_export."""
+    try:
+        from opentelemetry.sdk.trace import SpanProcessor
+    except Exception:
+        return
+    provider = getattr(getattr(langfuse, "_resources", None), "tracer_provider", None)
+    if provider is None or not hasattr(provider, "add_span_processor"):
+        return
+
+    class EndCounter(SpanProcessor):
+        def on_end(self, span: Any) -> None:
+            EXPORT_LEDGER.record_ended()
+
+    try:
+        provider.add_span_processor(EndCounter())
+        EXPORT_LEDGER.counting = True
+    except Exception as e:
+        debug(f"end counter unavailable: {e}")
+
+
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
     # With capture off, stop the SDK from uploading base64 images it finds
     # in span payloads on its own. The SDK reads an empty value as enabled.
     if not CAPTURE_IMAGES and not os.environ.get("LANGFUSE_MEDIA_UPLOAD_ENABLED"):
         os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
+    reliability_kwargs: Dict[str, Any] = {}
+    id_generator = make_seeded_id_generator()
+    if id_generator is not None:
+        reliability_kwargs["id_generator"] = id_generator
     try:
-        return Langfuse(
-            public_key=config.public_key,
-            secret_key=config.secret_key,
-            host=config.host,
-        )
+        span_exporter = build_recording_span_exporter(config)
+    except Exception as e:
+        info(f"recording exporter setup failed ({type(e).__name__}: {e}); using SDK default")
+        span_exporter = None
+    if span_exporter is not None:
+        reliability_kwargs["span_exporter"] = span_exporter
+    # The SDK's batch queue defaults to 2048 spans and silently drops the
+    # rest; a resumed long session emits far more in one firing.
+    os.environ.setdefault("OTEL_BSP_MAX_QUEUE_SIZE", "1000000")
+    try:
+        try:
+            langfuse = Langfuse(
+                public_key=config.public_key,
+                secret_key=config.secret_key,
+                host=config.host,
+                timeout=EXPORT_REQUEST_TIMEOUT_S,
+                **reliability_kwargs,
+            )
+        except TypeError:
+            # SDK without id_generator/span_exporter parameters.
+            EXPORT_LEDGER.available = False
+            langfuse = Langfuse(
+                public_key=config.public_key,
+                secret_key=config.secret_key,
+                host=config.host,
+            )
+        # A globally registered TracerProvider ignores id_generator; install
+        # it on the tracer directly so span ids stay deterministic.
+        tracer = getattr(langfuse, "_otel_tracer", None)
+        if id_generator is not None and tracer is not None and hasattr(tracer, "id_generator") \
+                and tracer.id_generator is not id_generator:
+            tracer.id_generator = id_generator
+        install_end_counter(langfuse)
+        return langfuse
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
         return None
@@ -1895,9 +2240,7 @@ def _build_forced_trace_context(trace_id_hex: str,
         trace_id = int(trace_id_hex, 16)
         if trace_id == 0:
             return None
-        span_id = int(parent_span_id_hex, 16) if parent_span_id_hex else 0
-        while span_id == 0:
-            span_id = random.getrandbits(64)
+        span_id = int(parent_span_id_hex, 16) if parent_span_id_hex else phantom_span_id(trace_id_hex)
         parent_span_context = otel_trace_api.SpanContext(
             trace_id=trace_id,
             span_id=span_id,
@@ -1910,6 +2253,14 @@ def _build_forced_trace_context(trace_id_hex: str,
     except Exception as e:
         debug(f"forced trace context for {trace_id_hex!r} failed: {e}")
         return None
+
+def _span_context_hex(span: Any) -> Tuple[Optional[str], Optional[str]]:
+    """(trace_id, span_id) of a span as hex, or (None, None) if unavailable."""
+    try:
+        ctx = span.get_span_context()
+        return f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"
+    except Exception:
+        return None, None
 
 def _start_root_otel_span(langfuse: Langfuse, name: str, start_ns: Optional[int],
                           forced_trace_id: Optional[str],
@@ -1953,10 +2304,26 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
         )
     start_ns = to_otel_nanoseconds(start_time)
     if parent_otel_span is not None:
-        with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
-            otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+        trace_id_hex, parent_span_id_hex = _span_context_hex(parent_otel_span)
     else:
-        otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id, forced_parent_span_id)
+        trace_id_hex = forced_trace_id
+        parent_span_id_hex = forced_parent_span_id or (
+            f"{phantom_span_id(forced_trace_id):016x}" if forced_trace_id else None
+        )
+    seed = build_span_seed(
+        trace_id_hex=trace_id_hex,
+        parent_span_id_hex=parent_span_id_hex,
+        name=name,
+        as_type=as_type,
+        start_ns=start_ns,
+        obs_kwargs=obs_kwargs,
+    )
+    with seeded_span_id(seed):
+        if parent_otel_span is not None:
+            with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
+                otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+        else:
+            otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id, forced_parent_span_id)
     if as_root:
         # SDK/server contract: spans under a synthetic trace-id carrier have a
         # parentSpanId that never exports, so the server only treats them as
@@ -3108,7 +3475,7 @@ def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
             trace_id = langfuse.create_trace_id(seed=f"{session_id}:{user_row_uuid}")
         parent_context = otel_trace_api.SpanContext(
             trace_id=int(trace_id, 16),
-            span_id=int(root_span_id, 16) if root_span_id else (random.getrandbits(64) or 1),
+            span_id=int(root_span_id, 16) if root_span_id else phantom_span_id(trace_id),
             trace_flags=otel_trace_api.TraceFlags(0x01),  # sampled
             is_remote=False,
         )
@@ -3414,10 +3781,19 @@ def emit_new_turns_from_transcript(
     transcript_path: Path,
     *,
     flush_deferred_agent_turns: bool = False,
+    commit_gate: Optional[Callable[[], bool]] = None,
+    lock_timeout_s: float = 2.0,
 ) -> int:
+    """Emit the transcript's new turns; returns how many turns were emitted.
+
+    commit_gate runs after emission, under the session lock. If it returns
+    False (export not confirmed) the session state is NOT saved: the next
+    firing re-reads the same rows and re-emits them, which is idempotent
+    because span ids are deterministic.
+    """
     key = get_session_state_key(session_id, str(transcript_path))
 
-    with FileLock(get_session_lock_path(key)):
+    with FileLock(get_session_lock_path(key), timeout_s=lock_timeout_s):
         with FileLock(LOCK_FILE):
             state = load_hook_state()
         session_state = get_session_state(state, key)
@@ -3484,10 +3860,16 @@ def emit_new_turns_from_transcript(
             session_history=session_history,
         )
 
-        # Known limitation (accepted, like the crash-between-emit-and-save
-        # duplicate window): progress is persisted before the SDK flush in
-        # main(); a dropped flush leaves emitted_keys pointing at spans that
-        # never reached the server.
+        # Commit only what provably reached Langfuse. Persisting progress
+        # before the flush lost every span of a dropped flush for good
+        # (langfuse/Claude-Observability-Plugin#103).
+        if commit_gate is not None and not commit_gate():
+            info(
+                f"Langfuse export not confirmed; state not advanced, {emitted} turn(s) "
+                f"will be re-emitted next firing (session={session_id})"
+            )
+            return emitted
+
         with FileLock(LOCK_FILE):
             state = load_hook_state()
             save_session_state(state, key, session_state)
@@ -3515,6 +3897,43 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
         pass
 
 
+def spawn_detached_worker(payload: Dict[str, Any]) -> bool:
+    """Re-run this hook in a new session that survives Claude Code's exit.
+
+    The worker gets the payload on stdin and DETACHED_WORKER_ENV set.
+    Returns False (caller handles the payload inline) if spawning fails or
+    CC_LANGFUSE_NO_DETACH=true.
+    """
+    if _opt("CC_LANGFUSE_NO_DETACH").lower() == "true":
+        return False
+    try:
+        import subprocess
+        env = dict(os.environ)
+        env[DETACHED_WORKER_ENV] = "1"
+        kwargs: Dict[str, Any] = dict(
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            close_fds=True,
+        )
+        if os.name == "nt":
+            kwargs["creationflags"] = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+        else:
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__)], **kwargs)
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(payload).encode("utf-8"))
+        proc.stdin.close()
+        return True
+    except Exception as e:
+        info(f"could not start detached SessionEnd worker ({type(e).__name__}: {e}); running inline")
+        return False
+
+
 # ----------------- Main -----------------
 def main() -> int:
     start = time.time()
@@ -3537,10 +3956,23 @@ def main() -> int:
 
     session_id, transcript_path = hook_context
     flush_deferred_agent_turns = is_session_end_hook_payload(payload)
+    is_detached_worker = os.environ.get(DETACHED_WORKER_ENV) == "1"
+
+    # SessionEnd runs synchronously and Claude Code kills it during shutdown,
+    # so hand the work to a detached process that outlives the CLI.
+    if flush_deferred_agent_turns and not is_detached_worker and spawn_detached_worker(payload):
+        debug(f"SessionEnd handed to detached worker (session={session_id})")
+        return 0
 
     langfuse = create_langfuse_client(config)
     if langfuse is None:
         return 0
+
+    commit = {"confirmed": None}
+
+    def commit_gate() -> bool:
+        commit["confirmed"] = confirm_export(langfuse)
+        return commit["confirmed"]
 
     try:
         emitted = emit_new_turns_from_transcript(
@@ -3549,10 +3981,17 @@ def main() -> int:
             session_id,
             transcript_path,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
+            commit_gate=commit_gate,
+            # The worker waits out an in-flight Stop firing of the same session
+            # instead of skipping the session's final emission.
+            lock_timeout_s=FLUSH_TIMEOUT_S + 30.0 if is_detached_worker else 2.0,
         )
 
         dur = time.time() - start
-        info(f"Processed {emitted} turns in {dur:.2f}s (session={session_id})")
+        status = "export confirmed" if commit["confirmed"] else "export NOT confirmed, will retry"
+        if not EXPORT_LEDGER.available:
+            status += " (export failures not observable)"
+        info(f"Processed {emitted} turns in {dur:.2f}s, {status} (session={session_id})")
         return 0
 
     except TimeoutError as e:
