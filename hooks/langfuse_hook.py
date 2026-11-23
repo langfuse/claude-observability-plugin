@@ -60,6 +60,10 @@ FLUSH_TIMEOUT_S = _positive_float_opt("CC_LANGFUSE_FLUSH_TIMEOUT_S", 120.0)
 # Per-request timeout of the OTLP export (the SDK default of 5s is too short
 # for large backlogs, especially with image capture on).
 EXPORT_REQUEST_TIMEOUT_S = int(_positive_float_opt("CC_LANGFUSE_EXPORT_TIMEOUT_S", 30.0))
+# Target size of one OTLP export request; batches are split to stay below it.
+MAX_REQUEST_BYTES = int(_positive_float_opt("CC_LANGFUSE_MAX_REQUEST_MB", 8.0) * 1024 * 1024)
+# The OTLP HTTP exporter's own limit; a single span above it is undeliverable.
+HARD_REQUEST_LIMIT_BYTES = 64 * 1024 * 1024
 # Set on the detached worker that SessionEnd hands its work to.
 DETACHED_WORKER_ENV = "CC_LANGFUSE_DETACHED_WORKER"
 
@@ -479,6 +483,11 @@ class ExportLedger:
         self.available = False  # True once the recording exporter is wired in
         self.exported = 0
         self.failed = 0
+        self.oversized = 0
+
+    def record_oversized(self, count: int) -> None:
+        with self.lock:
+            self.oversized += count
 
     def record(self, count: int, ok: bool) -> None:
         with self.lock:
@@ -489,6 +498,29 @@ class ExportLedger:
 
 
 EXPORT_LEDGER = ExportLedger()
+
+
+def split_into_requests(spans: Any, size_of: Callable[[Any], int], max_bytes: int,
+                        hard_limit: int) -> Tuple[List[List[Any]], List[Tuple[Any, int]]]:
+    """Group spans into requests of at most max_bytes (a single larger span
+    gets a request of its own); spans above hard_limit are returned apart."""
+    chunks: List[List[Any]] = []
+    oversized: List[Tuple[Any, int]] = []
+    current: List[Any] = []
+    current_size = 0
+    for span in spans:
+        size = size_of(span)
+        if size > hard_limit:
+            oversized.append((span, size))
+            continue
+        if current and current_size + size > max_bytes:
+            chunks.append(current)
+            current, current_size = [], 0
+        current.append(span)
+        current_size += size
+    if current:
+        chunks.append(current)
+    return chunks, oversized
 
 
 def build_recording_span_exporter(config: "LangfuseConfig") -> Optional[Any]:
@@ -523,18 +555,46 @@ def build_recording_span_exporter(config: "LangfuseConfig") -> Optional[Any]:
         timeout=EXPORT_REQUEST_TIMEOUT_S,
     )
 
+    try:
+        from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+    except Exception:
+        encode_spans = None
+
+    def span_size(span: Any) -> int:
+        if encode_spans is None:
+            return 0
+        try:
+            return encode_spans([span]).ByteSize()
+        except Exception:
+            return 0
+
     class RecordingSpanExporter(SpanExporter):
         def export(self, spans):  # type: ignore[override]
-            try:
-                result = inner.export(spans)
-            except Exception as e:
-                info(f"Langfuse export raised {type(e).__name__}: {e}")
-                result = SpanExportResult.FAILURE
-            ok = result == SpanExportResult.SUCCESS
-            EXPORT_LEDGER.record(len(spans), ok)
-            if not ok:
-                info(f"Langfuse export failed for {len(spans)} span(s); they will be retried next firing")
-            return result
+            # Generation inputs carry the conversation so far, so one late
+            # turn can serialize to tens of MB; a default 512-span batch then
+            # exceeds the exporter's request limit and is dropped whole.
+            # Split into requests of at most MAX_REQUEST_BYTES.
+            chunks, oversized = split_into_requests(spans, span_size, MAX_REQUEST_BYTES, HARD_REQUEST_LIMIT_BYTES)
+            for span, size in oversized:
+                # Can never be delivered; counting it as a failure would
+                # block the session's progress forever.
+                EXPORT_LEDGER.record_oversized(1)
+                info(f"Dropping span {getattr(span, 'name', '?')!r}: {size} bytes exceeds the "
+                     f"{HARD_REQUEST_LIMIT_BYTES}-byte request limit")
+
+            overall = SpanExportResult.SUCCESS
+            for chunk in chunks:
+                try:
+                    result = inner.export(chunk)
+                except Exception as e:
+                    info(f"Langfuse export raised {type(e).__name__}: {e}")
+                    result = SpanExportResult.FAILURE
+                ok = result == SpanExportResult.SUCCESS
+                EXPORT_LEDGER.record(len(chunk), ok)
+                if not ok:
+                    overall = SpanExportResult.FAILURE
+                    info(f"Langfuse export failed for {len(chunk)} span(s); they will be retried next firing")
+            return overall
 
         def shutdown(self) -> None:
             inner.shutdown()

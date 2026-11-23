@@ -230,6 +230,16 @@ def test_confirm_export_fails_when_flush_hangs(hook_module, fresh_ledger):
         release.set()
 
 
+# ---- Request splitting ----
+def test_split_into_requests(hook_module):
+    sizes = {"a": 3, "b": 3, "c": 3, "big": 10, "huge": 100, "d": 1}
+    chunks, oversized = hook_module.split_into_requests(
+        ["a", "b", "c", "big", "huge", "d"], sizes.__getitem__, max_bytes=7, hard_limit=50,
+    )
+    assert chunks == [["a", "b"], ["c"], ["big"], ["d"]]
+    assert oversized == [("huge", 100)]
+
+
 # ---- Detached SessionEnd worker ----
 def test_spawn_detached_worker(hook_module, monkeypatch):
     import subprocess

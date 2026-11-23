@@ -146,6 +146,8 @@ def main() -> int:
     parser.add_argument("--days", type=int, default=30, help="only transcripts modified in the last N days")
     parser.add_argument("--session", help="only this session id")
     parser.add_argument("--apply", action="store_true", help="actually send (default: dry run)")
+    parser.add_argument("--flush-timeout", type=float, default=1800.0,
+                        help="seconds to wait for one session's export (long sessions are large)")
     parser.add_argument("--skip-active-minutes", type=int, default=60,
                         help="skip transcripts modified this recently (the live hook still owns them)")
     parser.add_argument("--projects-dir", default=str(Path.home() / ".claude" / "projects"))
@@ -206,7 +208,7 @@ def main() -> int:
         confirmed = {"ok": True}
 
         def gate() -> bool:
-            confirmed["ok"] = hook.confirm_export(langfuse) if args.apply else True
+            confirmed["ok"] = hook.confirm_export(langfuse, timeout_s=args.flush_timeout) if args.apply else True
             return confirmed["ok"]
 
         try:
