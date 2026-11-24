@@ -589,13 +589,15 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
 
 
 def find_state_key_of_moved_session(
-    global_state: Dict[str, Any], session_id: str, transcript_path: str
+    global_state: Dict[str, Any], session_id: str, transcript_path: str, transcript_size: int
 ) -> Optional[str]:
     """Key of the entry this session wrote under an earlier transcript path.
 
     Moving a session (EnterWorktree, a desktop directory change) puts its
     transcript under another project directory with the same session id and
     the same leading bytes, so the earlier entry's offset still applies.
+    A file shorter than that offset is not the moved transcript: it is a new
+    file that another process on the session started at its old path.
     """
     candidates = [
         (str(entry.get("updated", "")), key)
@@ -604,6 +606,7 @@ def find_state_key_of_moved_session(
         and entry.get("session_id") == session_id
         and entry.get("transcript_path")
         and entry.get("transcript_path") != transcript_path
+        and int(entry.get("offset") or 0) <= transcript_size
     ]
     return max(candidates)[1] if candidates else None
 
@@ -3452,7 +3455,9 @@ def emit_new_turns_from_transcript(
 
         moved_from_key = None
         if key not in state:
-            moved_from_key = find_state_key_of_moved_session(state, session_id, str(transcript_path))
+            moved_from_key = find_state_key_of_moved_session(
+                state, session_id, str(transcript_path), transcript_path.stat().st_size
+            )
         if moved_from_key:
             session_state = get_session_state(state, moved_from_key)
             info(f"session moved from {session_state.transcript_path}; continuing at byte {session_state.offset}")
