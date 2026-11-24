@@ -537,6 +537,10 @@ class SessionState:
     # partially emitted turn across firings and across the open -> closed ->
     # deferred transitions; entries are dropped once the turn is finalized.
     turn_progress: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Where the state was read from, so a session that moves to another
+    # project directory can find the entry it wrote before the move.
+    session_id: str = ""
+    transcript_path: str = ""
 
 def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
@@ -564,6 +568,8 @@ def get_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
         open_turn=open_turn,
         turn_numbers=turn_numbers,
         turn_progress=turn_progress,
+        session_id=str(s.get("session_id", "")),
+        transcript_path=str(s.get("transcript_path", "")),
     )
 
 def update_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
@@ -576,8 +582,31 @@ def update_session_state(global_state: Dict[str, Any], key: str, session_state: 
         "open_turn": session_state.open_turn or {},
         "turn_numbers": session_state.turn_numbers or {},
         "turn_progress": session_state.turn_progress or {},
+        "session_id": session_state.session_id,
+        "transcript_path": session_state.transcript_path,
         "updated": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def find_state_key_of_moved_session(
+    global_state: Dict[str, Any], session_id: str, transcript_path: str
+) -> Optional[str]:
+    """Key of the entry this session wrote under an earlier transcript path.
+
+    Moving a session (EnterWorktree, a desktop directory change) puts its
+    transcript under another project directory with the same session id and
+    the same leading bytes, so the earlier entry's offset still applies.
+    """
+    candidates = [
+        (str(entry.get("updated", "")), key)
+        for key, entry in global_state.items()
+        if isinstance(entry, dict)
+        and entry.get("session_id") == session_id
+        and entry.get("transcript_path")
+        and entry.get("transcript_path") != transcript_path
+    ]
+    return max(candidates)[1] if candidates else None
+
 
 def sweep_stale_session_locks(state: Dict[str, Any], cutoff: datetime) -> None:
     live = {k[:16] for k in state if isinstance(k, str)}
@@ -3420,7 +3449,17 @@ def emit_new_turns_from_transcript(
     with FileLock(get_session_lock_path(key)):
         with FileLock(LOCK_FILE):
             state = load_hook_state()
-        session_state = get_session_state(state, key)
+
+        moved_from_key = None
+        if key not in state:
+            moved_from_key = find_state_key_of_moved_session(state, session_id, str(transcript_path))
+        if moved_from_key:
+            session_state = get_session_state(state, moved_from_key)
+            info(f"session moved from {session_state.transcript_path}; continuing at byte {session_state.offset}")
+        else:
+            session_state = get_session_state(state, key)
+        session_state.session_id = session_id
+        session_state.transcript_path = str(transcript_path)
 
         subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
         if subagent_transcripts_by_tool_use_id:
@@ -3490,6 +3529,8 @@ def emit_new_turns_from_transcript(
         # never reached the server.
         with FileLock(LOCK_FILE):
             state = load_hook_state()
+            if moved_from_key:
+                state.pop(moved_from_key, None)
             save_session_state(state, key, session_state)
 
     return emitted
