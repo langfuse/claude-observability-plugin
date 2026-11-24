@@ -129,3 +129,27 @@ def test_turn_open_at_the_move_is_exported_once(
     assert sorted(turn_numbers(fake_langfuse.observations)) == [1, 2, 3, 4]
     generations = [o for o in fake_langfuse.observations if o.as_type == "generation"]
     assert len(generations) == 4
+
+
+def test_process_still_writing_the_old_path_after_the_move_does_not_take_the_session(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path
+):
+    original = transcript_in(tmp_path, "C--repo")
+    append_turns(original, range(1, 3))
+    config = config_for(hook_module)
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, original)
+
+    worktree = move(original, transcript_in(tmp_path, "C--repo--claude-worktrees-live"), False)
+    append_turns(worktree, range(3, 4))
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, worktree)
+
+    # A second Claude Code process on the same session keeps writing the old
+    # path, which starts a new, shorter file there.
+    append_turns(original, range(9, 10))
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, original)
+    before_next_turn = len(fake_langfuse.observations)
+
+    append_turns(worktree, range(4, 5))
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, SESSION, worktree)
+
+    assert turn_numbers(fake_langfuse.observations[before_next_turn:]) == [4]
